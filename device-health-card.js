@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.17.3
+ * @version 2026.8.17
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.18';
+  const CARD_VERSION = '2026.8.17';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -2719,12 +2719,16 @@ ha-card.sec { padding: 10px 12px 12px; overflow: hidden; }
 ha-card.mini { overflow: hidden; }
 ha-card.mini .pill {
   width: 100%; border: 0; border-radius: var(--ha-card-border-radius, 12px);
-  font: inherit; text-align: left; cursor: pointer;
+  font: inherit; text-align: left; cursor: default;
   /* The pill fills the card here rather than sitting inside a summary strip,
      so the icon would otherwise start hard against the card's own edge. */
   padding: 8px 7px 8px 12px;
 }
-ha-card.mini .pill:hover { background: color-mix(in srgb, var(--dh-accent) 20%, transparent); }
+/* Only a tile with somewhere to go offers to be tapped. Without a
+   navigation_path it is a readout, and says so by not reacting.
+   No backticks in here: this block is a template literal. */
+ha-card.mini .pill.is-tappable { cursor: pointer; }
+ha-card.mini .pill.is-tappable:hover { background: color-mix(in srgb, var(--dh-accent) 20%, transparent); }
 /* The detail row is always on for a mini tile - it is the tile's only prose -
    and only steps aside when the track is too narrow to hold a word of it. */
 ha-card.mini .pnote {

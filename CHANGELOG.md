@@ -4,7 +4,7 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
-## 2026.8.18
+## 2026.8.17
 
 First public release.
 

@@ -1,4 +1,4 @@
-# HA - Health Check
+# HA - Device Health view
 
 A Home Assistant card that answers two questions and keeps them strictly apart:
 **is anything broken right now**, and **does everything my configuration points at still exist**.
@@ -49,7 +49,7 @@ required for any of it, and nothing is ever written: the inspector diagnoses and
 ### HACS (custom repository)
 
 1. HACS → ⋮ → **Custom repositories**
-2. URL: `https://github.com/ilirdokle43/HA-Health-Check`, type: **Dashboard**
+2. URL: `https://github.com/ilirdokle43/HA-Device-Health-View`, type: **Dashboard**
 3. Install, then reload your browser.
 
 ### Manual
@@ -82,7 +82,7 @@ That is the whole configuration. Everything below is optional.
 | `exclude` | `[]` | Regular expressions matched against entity ids |
 | `sections` | all | Which sections to render, in order |
 | `cluster` | see below | Shared-cause detection thresholds |
-| `navigation_path` | `/dashboard-monitor/health` | Where the compact tiles navigate on tap |
+| `navigation_path` | none | Path the compact tiles open on tap. Unset, they are readouts and do not react to a tap |
 
 A worked example:
 
@@ -105,11 +105,13 @@ For a main dashboard, where you normally want to see nothing at all:
 ```yaml
 type: custom:device-health-card
 mode: device-compact
+navigation_path: /my-dashboard/health
 grid_options: { columns: 6, rows: auto }
 ```
 ```yaml
 type: custom:device-health-card
 mode: configuration-compact
+navigation_path: /my-dashboard/health
 grid_options: { columns: 6, rows: auto }
 ```
 
@@ -118,7 +120,9 @@ grid_options: { columns: 6, rows: auto }
 **The pair lives or dies together.** When neither has anything to report, both disappear
 completely — not a green card, not a zero, no empty cell; the dashboard closes the space. When
 *either* has something, both appear so the row is full width, and the quiet one goes grey.
-Tapping either one opens the full page.
+
+Set `navigation_path` to wherever you put the full page and a tap will open it. Leave it out and
+the tiles are readouts.
 
 Placed on their own, without the other, each tile simply hides itself when it has nothing to
 say.

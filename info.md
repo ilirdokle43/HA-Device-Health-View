@@ -1,4 +1,4 @@
-# HA - Health Check
+# HA - Device Health view
 
 Two questions, kept strictly apart: **is anything broken right now**, and **does everything my
 configuration points at still exist**.
@@ -22,4 +22,4 @@ Uses only Home Assistant's own APIs. Nothing is ever written — it diagnoses an
 type: custom:device-health-card
 ```
 
-Full documentation in the [README](https://github.com/ilirdokle43/HA-Health-Check).
+Full documentation in the [README](https://github.com/ilirdokle43/HA-Device-Health-View).

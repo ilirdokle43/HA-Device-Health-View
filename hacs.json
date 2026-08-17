@@ -1,5 +1,5 @@
 {
-  "name": "HA - Health Check",
+  "name": "HA - Device Health view",
   "filename": "device-health-card.js",
   "content_in_root": true
 }
