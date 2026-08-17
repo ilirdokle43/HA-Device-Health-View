@@ -1,0 +1,5 @@
+{
+  "name": "HA - Health Check",
+  "filename": "device-health-card.js",
+  "content_in_root": true
+}

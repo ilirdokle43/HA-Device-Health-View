@@ -1,0 +1,25 @@
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# Dumps of a live Home Assistant: every entity, device, area, automation,
+# script and dashboard of a real house. Never publish these.
+data/
+
+# Snapshots of live dashboards taken before editing them.
+backups/
+
+# Working screenshots rendered from the live dump — they carry real device and
+# room names. The published ones in screenshots/ come from invented data.
+shots/
+
+# Test harness and deployment tooling. The harness is generated from the live
+# dump, and the tools carry the address of a specific Home Assistant instance.
+dev/
+tools/
+
+# Private dashboard configuration and previews.
+*.local.yaml
+*.local.html
+*.local.json
