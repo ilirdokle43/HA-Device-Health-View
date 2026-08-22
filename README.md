@@ -74,7 +74,7 @@ That is the whole configuration. Everything below is optional.
 | Option | Default | What it does |
 |---|---|---|
 | `mode` | `full` | `full`, `device-compact` or `configuration-compact` |
-| `battery_threshold` | `20` | Percent at or under which a battery needs attention |
+| `battery_threshold` | `18` | Percent at or under which a battery needs attention |
 | `degraded_ratio` | `0.5` | Fraction of a device's entities that must be unavailable before it is "degraded" rather than "offline" |
 | `recovery_minutes` | `120` | How long a recovered or deleted device stays listed |
 | `ignored_domains` | see below | Domains whose resting state looks like a fault |

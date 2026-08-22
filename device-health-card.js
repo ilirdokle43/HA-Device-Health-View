@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.22
+ * @version 2026.8.22.1
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.22';
+  const CARD_VERSION = '2026.8.22.1';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -117,7 +117,7 @@
   const SKIP_LABEL_NAME = 'Skip health checks';
 
   /** Battery percentage at or below which a device wants attention. */
-  const DEFAULT_BATTERY_THRESHOLD = 20;
+  const DEFAULT_BATTERY_THRESHOLD = 18;
 
   /**
    * A device is only called DEGRADED when at least this share of its runtime

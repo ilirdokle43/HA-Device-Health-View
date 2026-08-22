@@ -4,6 +4,13 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.22.1
+
+- **The default battery threshold is now 18%**, down from 20%. Devices that live on a charger
+  commonly rest at exactly 20%, so a threshold of 20 flagged them permanently. 18 leaves a
+  couple of points of margin and reports only batteries that are genuinely heading down.
+  `battery_threshold` still overrides it.
+
 ## 2026.8.22
 
 ### Skipping a device
