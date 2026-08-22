@@ -4,6 +4,26 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.22
+
+### Skipping a device
+
+- **Skip** on any device in Needs attention stops the card checking it — for devices that are
+  off on purpose, like a desktop shut down when the house is empty.
+- A **Skipped devices** section lists them with an **Un-skip** button, and is hidden entirely
+  while nothing is skipped. Each row reports what the skip is currently suppressing, so a skip
+  that has started hiding a real fault stays visible.
+- A skipped device leaves the monitored population rather than being counted as healthy, and is
+  excluded from the problem list, the low-battery list, the integration grid and shared-cause
+  clustering.
+- The list is a label on the device registry, so it is install-wide rather than per-browser, and
+  can be managed from Settings → Devices. `skip_label` and `exclude_devices` configure it.
+
+### Fixed
+
+- `navigation_path` no longer defaults to a path that only existed on the author's install. The
+  compact tiles are readouts until it is set, and no longer offer a tap that goes nowhere.
+
 ## 2026.8.17
 
 First public release.

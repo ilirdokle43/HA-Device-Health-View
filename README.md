@@ -80,6 +80,8 @@ That is the whole configuration. Everything below is optional.
 | `ignored_domains` | see below | Domains whose resting state looks like a fault |
 | `exclude_integrations` | `[]` | Integrations to leave out entirely |
 | `exclude` | `[]` | Regular expressions matched against entity ids |
+| `skip_label` | `skip_health_checks` | Label id that marks a device as skipped |
+| `exclude_devices` | `[]` | Device ids to skip without using a label |
 | `sections` | all | Which sections to render, in order |
 | `cluster` | see below | Shared-cause detection thresholds |
 | `navigation_path` | none | Path the compact tiles open on tap. Unset, they are readouts and do not react to a tap |
@@ -126,6 +128,30 @@ the tiles are readouts.
 
 Placed on their own, without the other, each tile simply hides itself when it has nothing to
 say.
+
+## Skipping a device
+
+Some devices are off on purpose — a desktop shut down when the house is empty, a socket cut
+at the wall for the winter — and reporting them as unreachable is noise rather than news.
+
+Expand any device in **Needs attention** and press **Skip**. It leaves the checks
+immediately and moves to a **Skipped devices** section, which is hidden entirely while
+nothing is skipped. Each row there shows what the skip is currently suppressing, so a device
+skipped a year ago that is now genuinely dead is still easy to notice, and an **Un-skip**
+button puts it back.
+
+A skipped device leaves the monitored population altogether rather than being counted as
+healthy: calling a deliberately powered-off machine "online" would be as wrong as calling it
+offline.
+
+The list is stored as a **label on the device registry**, not in the browser, for two
+reasons: it is install-wide, so skipping a device at a desk also skips it on every wall
+tablet; and it is visible and removable in **Settings → Devices**, so the state is never
+trapped inside this card. The label is created the first time it is needed.
+
+That also gives you two other ways in, for a device that is currently healthy and so has no
+card to press Skip on: add the label by hand in Settings, or name the device in
+`exclude_devices`.
 
 ## How runtime health is decided
 
@@ -209,6 +235,7 @@ LOW BATTERY            devices at or under the threshold
 INTEGRATIONS           every integration with a device, problems highlighted
 RECENTLY RECOVERED     devices that came back
 RECENTLY DELETED       devices removed from the registry
+SKIPPED DEVICES        devices you have told the card to leave alone
 ENTITY-ONLY PROBLEMS   device-less helpers and templates, grouped by integration
 ```
 

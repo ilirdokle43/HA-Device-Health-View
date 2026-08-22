@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.17
+ * @version 2026.8.22
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.17';
+  const CARD_VERSION = '2026.8.22';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -100,6 +100,22 @@
    */
   const DEFAULT_EXCLUDED_INTEGRATIONS = ['ibeacon'];
 
+  /**
+   * Skipping a device.
+   *
+   * Some devices are switched off on purpose - a desktop shut down when the
+   * house is empty, a socket cut at the wall for the winter - and reporting
+   * them as unreachable is noise rather than news.
+   *
+   * The list of skipped devices is kept as a **label on the device registry**
+   * rather than in the card's own storage, for two reasons. It is
+   * install-wide, so skipping a device at a desk also skips it on every wall
+   * tablet, which per-user frontend storage would not; and it is visible and
+   * removable in Settings, so the state is never trapped inside this card.
+   */
+  const DEFAULT_SKIP_LABEL = 'skip_health_checks';
+  const SKIP_LABEL_NAME = 'Skip health checks';
+
   /** Battery percentage at or below which a device wants attention. */
   const DEFAULT_BATTERY_THRESHOLD = 20;
 
@@ -139,12 +155,12 @@
    * the two compact modes are alert tiles for a main dashboard that show
    * nothing at all when there is nothing wrong.
    */
-  const MODES = ['full', 'device-compact', 'configuration-compact'];
+  const MODES = ['full', 'device-compact', 'configuration-compact', 'conflicts-compact', 'overall-compact'];
   const isCompact = (mode) => mode !== 'full';
 
   const DEFAULT_SECTIONS = [
-    'house', 'summary', 'config_summary', 'clusters', 'attention', 'config',
-    'battery', 'integrations', 'recovered', 'deleted', 'orphans',
+    'house', 'summary', 'config_summary', 'clusters', 'attention', 'config', 'conflicts',
+    'battery', 'integrations', 'recovered', 'deleted', 'skipped', 'orphans',
   ];
 
   /* States that carry no usable reading. */
@@ -324,6 +340,14 @@
     const ignoredDomains = new Set(cfg.ignored_domains);
     const excludedIntegrations = new Set(cfg.exclude_integrations);
     const excludes = toRegex(cfg.exclude);
+    /* Devices the user has told the card to leave alone, by label or by a
+       static id in the card's own YAML. */
+    const skipLabel = cfg.skip_label;
+    const skippedIds = new Set(cfg.exclude_devices || []);
+    for (const id in devices) {
+      const labels = devices[id].labels;
+      if (labels && labels.indexOf(skipLabel) >= 0) skippedIds.add(id);
+    }
 
     /* ---- pass 1: bucket every usable entity onto its device ---------- */
     const byDevice = new Map();
@@ -401,6 +425,7 @@
     /* ---- pass 2: classify each device -------------------------------- */
     const population = [];
     const problems = [];
+    const skipped = [];
 
     for (const [deviceId, bucket] of byDevice) {
       const device = devices[deviceId];
@@ -412,6 +437,27 @@
 
       const platform = pickPlatform(bucket.platforms, device, entities);
       if (excludedIntegrations.has(platform)) continue;
+
+      /* A skipped device leaves the population entirely rather than being
+         counted as healthy: calling a deliberately powered-off machine
+         "online" would be as wrong as calling it offline. It is listed in its
+         own section instead, so the decision stays visible. */
+      if (skippedIds.has(deviceId)) {
+        skipped.push({
+          key: deviceId,
+          deviceId,
+          name: device.name_by_user || device.name || deviceId,
+          area: (device.area_id && areas[device.area_id] && areas[device.area_id].name) || null,
+          platform,
+          integration: integrationName(platform, manifests),
+          entities: bucket.runtime.length,
+          /* What it would have been reported as, so the row can say whether
+             the skip is currently hiding anything - the point of the list is
+             to make a skip reviewable, not to hide the device twice over. */
+          wouldBe: firstSignal(bucket, cfg),
+        });
+        continue;
+      }
 
       const hub = device.via_device_id ? devices[device.via_device_id] : null;
       const hubName = hub ? hub.name_by_user || hub.name : null;
@@ -450,7 +496,7 @@
     }
 
     /* ---- batteries ---------------------------------------------------- */
-    const batteries = buildBatteries(batteryRows, devices, areas, states, entities, cfg, excludedIntegrations, manifests);
+    const batteries = buildBatteries(batteryRows, devices, areas, states, entities, cfg, excludedIntegrations, manifests, skippedIds);
     const lowBatteries = batteries.filter((b) => b.level !== null && b.level <= cfg.battery_threshold);
 
     /* ---- fold sub-devices into their parent ---------------------------- */
@@ -477,7 +523,7 @@
 
     problems.sort(byUrgency);
     return {
-      counts, population, problems, integrations, clusters, batteries, lowBatteries, orphans,
+      counts, population, problems, integrations, clusters, batteries, lowBatteries, orphans, skipped,
       /* Recovery tracking needs to tell "this device came back" from "this
          device was deleted", and the device registry is the only thing that
          knows the difference. */
@@ -533,6 +579,20 @@
   }
 
   /**
+   * Runs the same signals a live device would be put through, and reports the
+   * first that matches. Used only to describe a skipped device: it answers
+   * "what is this skip currently suppressing?" without letting the device back
+   * into any counter.
+   */
+  function firstSignal(bucket, cfg) {
+    for (const signal of HEALTH_SIGNALS) {
+      const issue = signal.evaluate(bucket, cfg);
+      if (issue) return { id: signal.id, label: signal.label, band: signal.band };
+    }
+    return null;
+  }
+
+  /**
    * Which integration owns a device. `primary_config_entry` is an entry id and
    * the frontend has no entry table, so the platform recorded on the device's
    * own entities is the reliable answer; the most common one wins when a
@@ -566,11 +626,14 @@
    * percentage sensor identifies the device, and a sibling charging flag is
    * folded in when the device exposes one.
    */
-  function buildBatteries(rows, devices, areas, states, entities, cfg, excluded, manifests) {
+  function buildBatteries(rows, devices, areas, states, entities, cfg, excluded, manifests, skippedIds) {
     const out = new Map();
     for (const r of rows) {
       const device = r.deviceId ? devices[r.deviceId] : null;
       if (device && device.disabled_by) continue;
+      /* Batteries are found from the sensor, not from the device loop, so a
+         skipped device would otherwise still surface here. */
+      if (skippedIds && r.deviceId && skippedIds.has(r.deviceId)) continue;
       const platform = r.platform;
       if (excluded.has(platform)) continue;
       const key = r.deviceId || r.entityId;
@@ -1728,6 +1791,1165 @@
     return out.filter(Boolean);
   }
 
+
+  /* ================================================================== *
+   * CONFLICT ANALYSIS
+   *
+   * A fourth question, alongside the others: can two scheduled runs get in
+   * each other's way?
+   *
+   * Home Assistant will happily let an automation fire at 05:15 while its own
+   * 05:00 run is still working through a delay. In `mode: single` the second
+   * run is dropped, silently, and the only symptom is that something did not
+   * happen. Nothing warns about it.
+   *
+   * This layer is READ ONLY in the strongest sense: it never calls a service,
+   * never triggers, enables, disables or edits anything. It reads the same
+   * automation and script configurations the inspector already fetched, and
+   * reasons about them statically.
+   *
+   * The whole design is built around not crying wolf. Two automations running
+   * at the same time is not a conflict; two automations fighting over the same
+   * switch is. Anything it cannot work out is reported as unknown rather than
+   * guessed, and an unknown runtime never becomes a conflict on its own.
+   * ================================================================== */
+
+  const DEFAULT_CONFLICTS = {
+    /* How close two scheduled starts must be to be worth mentioning even when
+       neither run is long enough to overlap the other. */
+    near_minutes: 2,
+    /* Depth limit for following script calls: deep enough for the real chains
+       on a normal install, shallow enough that a pathological one cannot hang
+       the page. Cycles are caught separately and exactly. */
+    max_script_depth: 4,
+    /* A `repeat` with more iterations than this is treated as unbounded rather
+       than multiplied out, so one silly loop cannot dominate the page. */
+    max_repeat_iterations: 500,
+    /* A run shorter than this is over before anything can collide with it.
+       Without this the page fills with automations that merely happen to fire
+       in the same minute and are finished instantly - true, and useless. */
+    min_runtime_minutes: 1,
+  };
+
+  const DAY_MIN = 1440;
+
+  /* ---------------------------------------------------------------- *
+   * Durations
+   * ---------------------------------------------------------------- */
+
+  /** True for anything carrying a Jinja template, which is not statically known. */
+  const isTemplate = (v) => typeof v === 'string' && v.indexOf('{{') >= 0;
+
+  /**
+   * Seconds from any shape Home Assistant accepts for a delay or a timeout: a
+   * bare number, "HH:MM:SS", "MM:SS", or a mapping. Returns null when it cannot
+   * be known, which is a different thing from zero.
+   */
+  function durationSeconds(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'number') return isFinite(value) ? value : null;
+
+    if (typeof value === 'string') {
+      if (isTemplate(value)) return null;
+      const parts = value.trim().split(':');
+      if (parts.length === 2 || parts.length === 3) {
+        const nums = parts.map(Number);
+        if (nums.some((n) => !isFinite(n))) return null;
+        return parts.length === 3
+          ? nums[0] * 3600 + nums[1] * 60 + nums[2]
+          : nums[0] * 60 + nums[1];
+      }
+      const n = Number(value);
+      return isFinite(n) ? n : null;
+    }
+
+    if (typeof value === 'object') {
+      let total = 0;
+      let saw = false;
+      const units = { days: 86400, hours: 3600, minutes: 60, seconds: 1, milliseconds: 0.001 };
+      for (const key in units) {
+        if (!(key in value)) continue;
+        const raw = value[key];
+        if (isTemplate(raw)) return null;
+        const n = Number(raw);
+        if (!isFinite(n)) return null;
+        total += n * units[key];
+        saw = true;
+      }
+      return saw ? total : null;
+    }
+    return null;
+  }
+
+  /** A duration estimate: a range, plus why it is not exact. */
+  const known = (sec) => ({ min: sec, max: sec, unknown: false, reasons: [] });
+  const unknownFor = (reason) => ({ min: 0, max: 0, unknown: true, reasons: [reason] });
+
+  function addDur(a, b) {
+    return {
+      min: a.min + b.min,
+      max: a.max + b.max,
+      unknown: a.unknown || b.unknown,
+      estimated: !!(a.estimated || b.estimated),
+      reasons: a.reasons.concat(b.reasons),
+    };
+  }
+
+  /** Widest of several branches: the shortest floor and the longest ceiling. */
+  function spanDur(list) {
+    if (!list.length) return known(0);
+    return {
+      min: Math.min.apply(null, list.map((d) => d.min)),
+      max: Math.max.apply(null, list.map((d) => d.max)),
+      unknown: list.some((d) => d.unknown),
+      estimated: list.some((d) => d.estimated),
+      reasons: list.reduce((acc, d) => acc.concat(d.reasons), []),
+    };
+  }
+
+  /**
+   * How long a sequence of actions takes, as a range.
+   *
+   * Only what actually consumes wall-clock time is counted: delays, and waits
+   * that carry a timeout. A service call is treated as instant, which is not
+   * exactly true but is true enough at this resolution - and erring short is
+   * the safe direction, because it makes the analyser claim fewer overlaps
+   * rather than more.
+   *
+   * `ctx` carries the script table, the stack of scripts already entered (for
+   * cycle detection), the remaining depth, and the trigger id that fired, which
+   * is what lets a `choose` be narrowed to the branch that can actually run.
+   */
+  function sequenceDuration(seq, ctx) {
+    if (!Array.isArray(seq)) return known(0);
+    let total = known(0);
+    for (const step of seq) total = addDur(total, stepDuration(step, ctx));
+    return total;
+  }
+
+  function stepDuration(step, ctx) {
+    if (!step || typeof step !== 'object') return known(0);
+
+    /* A step the user switched off does not run. */
+    if (step.enabled === false) return known(0);
+
+    if ('delay' in step) {
+      const sec = durationSeconds(step.delay);
+      return sec === null ? unknownFor('templated delay') : known(sec);
+    }
+
+    /* A wait with a timeout is bounded by it; without one it can wait for ever,
+       which is exactly where inventing a number would be wrong. */
+    if ('wait_template' in step || 'wait_for_trigger' in step) {
+      if (!('timeout' in step)) return unknownFor('wait without a timeout');
+      const sec = durationSeconds(step.timeout);
+      if (sec === null) return unknownFor('templated wait timeout');
+      /* It may return the moment the condition is met, so the floor is zero. */
+      return { min: 0, max: sec, unknown: false, reasons: [] };
+    }
+
+    if ('repeat' in step) return repeatDuration(step.repeat, ctx);
+
+    if ('choose' in step) {
+      const branches = Array.isArray(step.choose) ? step.choose : [];
+      const reachable = branches.filter((b) => branchReachable(b, ctx));
+      const durations = reachable.map((b) => sequenceDuration(b.sequence, ctx));
+      if (step.default) durations.push(sequenceDuration(step.default, ctx));
+      if (!durations.length) return known(0);
+      const span = spanDur(durations);
+      /* Only one branch runs. The floor is the shortest of them, but if some
+         branch could match nothing at all the floor is zero. */
+      const allReachable = reachable.length === branches.length && !step.default;
+      return { min: allReachable ? span.min : 0, max: span.max, unknown: span.unknown, reasons: span.reasons };
+    }
+
+    if ('if' in step) {
+      const thenD = sequenceDuration(step.then, ctx);
+      const elseD = step.else ? sequenceDuration(step.else, ctx) : known(0);
+      const span = spanDur([thenD, elseD]);
+      return { min: Math.min(thenD.min, elseD.min), max: span.max, unknown: span.unknown, reasons: span.reasons };
+    }
+
+    /* Branches run at the same time, so the slowest one sets the length. */
+    if ('parallel' in step) {
+      const list = Array.isArray(step.parallel) ? step.parallel : [];
+      const durations = list.map((b) =>
+        Array.isArray(b) ? sequenceDuration(b, ctx)
+          : b && b.sequence ? sequenceDuration(b.sequence, ctx)
+            : stepDuration(b, ctx));
+      if (!durations.length) return known(0);
+      const span = spanDur(durations);
+      return { min: Math.max.apply(null, durations.map((d) => d.min)), max: span.max, unknown: span.unknown, reasons: span.reasons };
+    }
+
+    if ('sequence' in step) return sequenceDuration(step.sequence, ctx);
+
+    const call = step.action || step.service;
+    if (isTemplate(call)) return unknownFor('templated action name');
+
+    /* Remember how long each timer was started for, so a loop that waits on it
+       further down the sequence has a bound to use. */
+    if (call === 'timer.start' && ctx.timers) {
+      const dur = resolveTemplatedDuration(step.data && step.data.duration, ctx.hass);
+      for (const e of targetEntities(step, ctx)) {
+        if (e.unresolved || e.id.indexOf('timer.') !== 0) continue;
+        /* `timer.start` with no duration restarts the timer at the one it
+           already has, so an entry is only ever replaced, never forgotten. */
+        if (dur) ctx.timers.set(e.id, dur);
+      }
+    }
+
+    /* A script called and waited on runs inline: its delays are this run's. */
+    if (typeof call === 'string') return scriptCallDuration(call, step, ctx);
+
+    return known(0);
+  }
+
+  function repeatDuration(repeat, ctx) {
+    if (!repeat || typeof repeat !== 'object') return known(0);
+
+    /* Read before the body is walked: the body may restart the very timer the
+       loop is waiting on, and the bound that matters is the one in force when
+       the loop was entered. */
+    const bound = timerBound(repeat, ctx);
+
+    const body = sequenceDuration(repeat.sequence, ctx);
+
+    if ('count' in repeat) {
+      if (isTemplate(repeat.count)) return unknownFor('templated repeat count');
+      const n = Number(repeat.count);
+      if (!isFinite(n) || n < 0) return unknownFor('unreadable repeat count');
+      if (n > ctx.limits.max_repeat_iterations) return unknownFor('very large repeat count');
+      return { min: body.min * n, max: body.max * n, unknown: body.unknown, reasons: body.reasons };
+    }
+    if ('for_each' in repeat) {
+      if (!Array.isArray(repeat.for_each)) return unknownFor('templated for_each');
+      const n = repeat.for_each.length;
+      return { min: body.min * n, max: body.max * n, unknown: body.unknown, reasons: body.reasons };
+    }
+    /* A loop that runs while a timer is active is bounded by that timer. */
+    if (bound) return bound;
+
+    /* while / until otherwise run an unknown number of times. */
+    return unknownFor('repeat with no fixed count');
+  }
+
+
+  /**
+   * How much of one loop iteration the watched timer is actually counting down
+   * for, and how long the iteration takes in total.
+   *
+   * A timer's duration is *countdown* time, not elapsed time: `timer.pause`
+   * stops the clock while the world keeps turning. The irrigation pattern of
+   * "five minutes on, five minutes off, repeat until the timer runs out" is
+   * exactly this - a 25-minute timer spends 25 minutes counting, but takes 50
+   * minutes of wall clock to do it.
+   *
+   * So the two are measured separately: delays that happen while the timer runs
+   * consume its duration, and every delay adds to the elapsed time.
+   */
+  function iterationTiming(seq, timerId, ctx, state) {
+    state = state || { running: true, active: 0, total: 0, unknown: false };
+    if (!Array.isArray(seq)) return state;
+
+    for (const step of seq) {
+      if (!step || typeof step !== 'object' || step.enabled === false) continue;
+
+      if ('delay' in step) {
+        const sec = durationSeconds(step.delay);
+        if (sec === null) { state.unknown = true; continue; }
+        state.total += sec;
+        if (state.running) state.active += sec;
+        continue;
+      }
+
+      /* Nested blocks still consume time; they are walked so a pause inside one
+         is not missed. Their branching is not modelled beyond this - a loop
+         whose iteration length depends on a condition is not something to be
+         confident about. */
+      if ('sequence' in step) { iterationTiming(step.sequence, timerId, ctx, state); continue; }
+      if ('if' in step) { iterationTiming(step.then, timerId, ctx, state); continue; }
+      if ('choose' in step) {
+        const branches = Array.isArray(step.choose) ? step.choose : [];
+        if (branches.length) iterationTiming(branches[0].sequence, timerId, ctx, state);
+        state.unknown = true;
+        continue;
+      }
+      if ('repeat' in step) { state.unknown = true; continue; }
+
+      const call = step.action || step.service;
+      if (typeof call !== 'string' || isTemplate(call)) continue;
+
+      /* Only commands aimed at the timer this loop is waiting on matter. */
+      if (call.indexOf('timer.') !== 0) continue;
+      const aimed = targetEntities(step, ctx).some((e) => e.id === timerId);
+      if (!aimed) continue;
+
+      const verb = call.slice('timer.'.length);
+      /* `timer.start` on a paused timer resumes it; on a running one it
+         restarts. Either way it is counting down afterwards. */
+      if (verb === 'start' || verb === 'resume' || verb === 'change') state.running = true;
+      else if (verb === 'pause') state.running = false;
+      else if (verb === 'cancel' || verb === 'finish') { state.running = false; state.unknown = true; }
+    }
+    return state;
+  }
+
+  /** The bound a `while <timer active>` loop takes from that timer, if known. */
+  function timerBound(repeat, ctx) {
+    const watched = timersWatchedBy(repeat.while || repeat.until);
+    for (const id of watched) {
+      const dur = ctx.timers && ctx.timers.get(id);
+      if (!dur) continue;
+
+      const t = iterationTiming(repeat.sequence, id, ctx, null);
+      const from = dur.source ? ', started from ' + dur.source : '';
+
+      /* No delay runs while the timer counts down, so the loop could turn over
+         for ever without spending any of it. */
+      if (!t.active) {
+        return unknownFor('loop on ' + id + ' never lets the timer count down');
+      }
+
+      /* Elapsed time is the timer's duration stretched by however much of each
+         iteration it spends paused. With no pause the two are the same. */
+      const stretch = t.total / t.active;
+      const seconds = dur.seconds * stretch;
+      const reason = stretch > 1.01
+        ? 'bounded by ' + id + from + ', stretched ' + (Math.round(stretch * 100) / 100) +
+          'x because the timer is paused for ' + Math.round((t.total - t.active) / 60) +
+          ' of every ' + Math.round(t.total / 60) + ' min'
+        : 'bounded by ' + id + from;
+
+      return {
+        min: 0,
+        max: seconds,
+        /* A branch inside the loop makes the iteration length a guess rather
+           than a measurement, so the estimate is offered but flagged. */
+        unknown: !!t.unknown,
+        estimated: true,
+        reasons: [reason + (t.unknown ? ' (iteration length varies)' : '')],
+      };
+    }
+    return null;
+  }
+
+  /**
+   * A `choose` branch is reachable from a given trigger unless it is gated on a
+   * *different* trigger id. This is what stops a seven-trigger irrigation
+   * automation being reported as seven overlapping half-hour runs: each trigger
+   * only reaches its own branch.
+   */
+  function branchReachable(branch, ctx) {
+    if (!branch || typeof branch !== 'object') return false;
+    if (branch.enabled === false) return false;
+    if (!ctx.triggerId) return true;
+    const conds = Array.isArray(branch.conditions) ? branch.conditions
+      : branch.conditions ? [branch.conditions] : [];
+    let gated = false;
+    for (const c of conds) {
+      if (!c || c.condition !== 'trigger') continue;
+      gated = true;
+      const ids = Array.isArray(c.id) ? c.id : [c.id];
+      if (ids.map(String).indexOf(String(ctx.triggerId)) >= 0) return true;
+    }
+    /* Gated on some other trigger: this branch cannot run for ours. */
+    return !gated;
+  }
+
+  function scriptCallDuration(call, step, ctx) {
+    const dot = call.indexOf('.');
+    const domain = dot > 0 ? call.slice(0, dot) : call;
+    const service = dot > 0 ? call.slice(dot + 1) : '';
+
+    /* `script.turn_on` starts a script without waiting for it, so it adds no
+       time to this run - a real difference from calling the script directly. */
+    if (domain === 'script' && (service === 'turn_on' || service === 'toggle' || service === 'turn_off')) {
+      return known(0);
+    }
+    if (domain !== 'script') {
+      const ent = firstEntityOf(step.target) || firstEntityOf(step.entity_id);
+      if (typeof ent !== 'string' || ent.indexOf('script.') !== 0) return known(0);
+      return enterScript(ent, ctx);
+    }
+    return enterScript('script.' + service, ctx);
+  }
+
+  function enterScript(target, ctx) {
+    if (ctx.stack.indexOf(target) >= 0) {
+      /* A script that calls itself, directly or through a chain. Counted once
+         and then stopped: the loop is real, and its length is not knowable. */
+      return unknownFor('recursive script call (' + target + ')');
+    }
+    if (ctx.depth >= ctx.limits.max_script_depth) {
+      return unknownFor('script nesting deeper than ' + ctx.limits.max_script_depth);
+    }
+    const script = ctx.scripts[target];
+    if (!script || !script.config) return unknownFor('script config not readable (' + target + ')');
+
+    return sequenceDuration(script.config.sequence, {
+      scripts: ctx.scripts,
+      limits: ctx.limits,
+      byDevice: ctx.byDevice,
+      byRegistryId: ctx.byRegistryId,
+      stack: ctx.stack.concat(target),
+      depth: ctx.depth + 1,
+      /* Trigger gating does not carry into a called script. */
+      triggerId: null,
+      /* Timers carry across the call: a script that starts a timer and then
+         loops on it is the common shape. */
+      timers: ctx.timers, hass: ctx.hass,
+    });
+  }
+
+  const firstEntityOf = (t) => {
+    if (!t) return null;
+    if (typeof t === 'string') return t;
+    if (Array.isArray(t)) return firstEntityOf(t[0]);
+    if (typeof t === 'object') return firstEntityOf(t.entity_id);
+    return null;
+  };
+
+
+  /* ---------------------------------------------------------------- *
+   * Timer-bounded loops
+   *
+   * `repeat: while <timer is active>` is the standard way to write "keep going
+   * until the timer runs out", and on its own it reads as an unbounded loop -
+   * which would make every irrigation script's runtime unknown and leave the
+   * analyser with nothing to say about exactly the automations it is most
+   * useful for.
+   *
+   * The bound is knowable, though, and without guessing: the `timer.start`
+   * that precedes the loop carries the duration. When that duration is a
+   * template it is resolved only in the one shape that can be resolved
+   * safely - a literal clock skeleton with a single `states()` lookup in it,
+   * read from the state machine. Anything more involved stays unknown.
+   * ---------------------------------------------------------------- */
+
+  /**
+   * A duration that may be templated. Returns { seconds, source } or null.
+   * Only `{{ states('x') }}`-shaped substitutions are resolved, and only when
+   * the result parses as a number; `| int(20)` style filters fall back to their
+   * default when the entity cannot be read.
+   */
+  function resolveTemplatedDuration(value, hass) {
+    const direct = durationSeconds(value);
+    if (direct !== null) return { seconds: direct, source: null };
+    if (typeof value !== 'string') return null;
+
+    let source = null;
+    let failed = false;
+    const filled = value.replace(/\{\{(.*?)\}\}/g, (whole, expr) => {
+      const ref = /states\(\s*['"]([a-z_]+\.[a-z0-9_]+)['"]\s*\)/i.exec(expr);
+      if (!ref) { failed = true; return ''; }
+      const entityId = ref[1];
+      const st = hass && hass.states && hass.states[entityId];
+      const n = st ? Number(st.state) : NaN;
+      if (isFinite(n)) {
+        source = entityId;
+        return String(Math.round(n));
+      }
+      /* `| int(20)` names its own fallback; using it is the same thing Home
+         Assistant would do with an unreadable entity. */
+      const dflt = /\|\s*int\(\s*(\d+)\s*\)/.exec(expr);
+      if (dflt) { source = entityId + ' (default)'; return dflt[1]; }
+      failed = true;
+      return '';
+    });
+    if (failed) return null;
+    const seconds = durationSeconds(filled.trim());
+    return seconds === null ? null : { seconds: seconds, source: source };
+  }
+
+  /** The timer entities a `while`/`until` block watches for being active. */
+  function timersWatchedBy(conditions) {
+    const out = [];
+    const walk = (c) => {
+      if (!c) return;
+      if (Array.isArray(c)) { c.forEach(walk); return; }
+      if (typeof c !== 'object') return;
+      if (c.conditions) walk(c.conditions);
+      if (c.condition !== 'state') return;
+      const states = [].concat(c.state === undefined ? [] : c.state).map(String);
+      /* Only "still running" counts. A loop that waits for `idle` is waiting
+         for something else to finish and is not bounded by this timer. */
+      if (!states.some((s) => s === 'active' || s === 'paused')) return;
+      for (const id of [].concat(c.entity_id || [])) {
+        if (typeof id === 'string' && id.indexOf('timer.') === 0) out.push(id);
+      }
+    };
+    walk(conditions);
+    return out;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Triggers
+   * ---------------------------------------------------------------- */
+
+  const pad2 = (n) => (n < 10 ? '0' : '') + n;
+  const minutesToClock = (m) => {
+    const t = ((Math.round(m) % DAY_MIN) + DAY_MIN) % DAY_MIN;
+    return pad2(Math.floor(t / 60)) + ':' + pad2(t % 60);
+  };
+
+  /** "HH:MM:SS" -> minutes past midnight, or null. */
+  function clockToMinutes(text) {
+    if (typeof text !== 'string' || isTemplate(text)) return null;
+    const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(text.trim());
+    if (!m) return null;
+    const h = Number(m[1]);
+    const mi = Number(m[2]);
+    if (h > 23 || mi > 59) return null;
+    return h * 60 + mi + (m[3] ? Number(m[3]) / 60 : 0);
+  }
+
+  /**
+   * The scheduled starts a trigger produces, as minutes past midnight.
+   *
+   * Only deterministic schedules are expanded. A state change, an MQTT message
+   * or a motion sensor has no predictable time, and pretending otherwise is how
+   * a monitor like this turns into noise - so those are recorded as dynamic and
+   * take no further part in the schedule analysis.
+   */
+  function triggerOccurrences(trig, hass) {
+    const kind = trig.trigger || trig.platform;
+    const out = { kind: kind, times: [], dynamic: false, note: null };
+
+    if (trig.enabled === false) { out.disabled = true; return out; }
+
+    if (kind === 'time') {
+      const list = Array.isArray(trig.at) ? trig.at : [trig.at];
+      for (const at of list) {
+        if (typeof at === 'string') {
+          const mins = clockToMinutes(at);
+          if (mins !== null) { out.times.push(mins); continue; }
+          /* `at` can name an input_datetime or a timestamp sensor: still a
+             schedule, just one stored elsewhere. */
+          if (at.indexOf('.') > 0) {
+            const resolved = resolveTimeEntity(at, hass);
+            if (resolved !== null) { out.times.push(resolved); out.note = 'from ' + at; continue; }
+            out.note = 'time helper ' + at + ' could not be read';
+            continue;
+          }
+          out.note = 'unreadable time';
+        } else if (at && typeof at === 'object' && at.entity_id) {
+          const resolved = resolveTimeEntity(at.entity_id, hass);
+          if (resolved !== null) { out.times.push(resolved); out.note = 'from ' + at.entity_id; }
+          else out.note = 'time helper could not be read';
+        }
+      }
+      return out;
+    }
+
+    if (kind === 'time_pattern') return timePatternOccurrences(trig, out);
+
+    if (kind === 'sun') {
+      const base = sunMinutes(hass, trig.event === 'sunset' ? 'next_setting' : 'next_rising');
+      if (base === null) { out.note = 'sun times unavailable'; return out; }
+      const offset = durationSeconds(trig.offset) || 0;
+      out.times.push(base + offset / 60);
+      /* Sunrise and sunset move a little every day, so a collision found today
+         is not guaranteed tomorrow. */
+      out.approximate = true;
+      out.note = trig.event + (trig.offset ? ' ' + trig.offset : '');
+      return out;
+    }
+
+    out.dynamic = true;
+    return out;
+  }
+
+  function resolveTimeEntity(entityId, hass) {
+    const st = hass && hass.states && hass.states[entityId];
+    if (!st) return null;
+    const direct = clockToMinutes(st.state);
+    if (direct !== null) return direct;
+    const attrs = st.attributes || {};
+    if (typeof attrs.hour === 'number' && typeof attrs.minute === 'number') {
+      return attrs.hour * 60 + attrs.minute;
+    }
+    /* A timestamp sensor: only its time of day is meaningful here. */
+    const parsed = Date.parse(st.state);
+    if (!isNaN(parsed)) {
+      const d = new Date(parsed);
+      return d.getHours() * 60 + d.getMinutes();
+    }
+    return null;
+  }
+
+  function sunMinutes(hass, attr) {
+    const sun = hass && hass.states && hass.states['sun.sun'];
+    const iso = sun && sun.attributes && sun.attributes[attr];
+    if (!iso) return null;
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    return d.getHours() * 60 + d.getMinutes();
+  }
+
+  /**
+   * `time_pattern` is a rhythm rather than a list of appointments. A dense one
+   * would swamp the page with identical conflicts, so it is summarised instead
+   * of expanded.
+   */
+  function timePatternOccurrences(trig, out) {
+    const readField = (v) => {
+      if (v === undefined || v === null) return { any: true };
+      if (typeof v === 'string' && v.charAt(0) === '/') {
+        const step = Number(v.slice(1));
+        return isFinite(step) && step > 0 ? { step: step } : { bad: true };
+      }
+      if (v === '*') return { any: true };
+      const n = Number(v);
+      return isFinite(n) ? { fixed: n } : { bad: true };
+    };
+    const H = readField(trig.hours);
+    const M = readField(trig.minutes);
+    if (H.bad || M.bad) { out.note = 'unreadable time pattern'; return out; }
+
+    if (trig.seconds !== undefined && trig.seconds !== null && String(trig.seconds) !== '0') {
+      out.note = 'fires on a seconds pattern';
+      out.tooDense = true;
+      return out;
+    }
+    if (M.step && M.step < 30) {
+      out.note = 'every ' + M.step + ' minutes';
+      out.tooDense = true;
+      return out;
+    }
+
+    const hours = H.fixed !== undefined ? [H.fixed] : rangeStep(0, 23, H.step || 1);
+    const minutes = M.fixed !== undefined ? [M.fixed] : M.step ? rangeStep(0, 59, M.step) : [0];
+
+    for (const h of hours) for (const m of minutes) out.times.push(h * 60 + m);
+    out.recurringPattern = true;
+    out.note = 'time pattern';
+    return out;
+  }
+
+  const rangeStep = (from, to, step) => {
+    const out = [];
+    for (let i = from; i <= to; i += step) out.push(i);
+    return out;
+  };
+
+  /* ---------------------------------------------------------------- *
+   * Targets
+   * ---------------------------------------------------------------- */
+
+  /* Pairs of services that undo each other. Used only to raise severity when
+     two overlapping runs aim them at the same entity. */
+  const OPPOSITES = [
+    ['turn_on', 'turn_off'], ['open_cover', 'close_cover'], ['lock', 'unlock'],
+    ['open', 'close'], ['start', 'stop'], ['arm_home', 'disarm'], ['arm_away', 'disarm'],
+    ['media_play', 'media_pause'],
+  ];
+
+  function areOpposites(a, b) {
+    const sa = String(a).split('.').pop();
+    const sb = String(b).split('.').pop();
+    if (sa === sb) return false;
+    for (const pair of OPPOSITES) {
+      if ((sa === pair[0] && sb === pair[1]) || (sa === pair[1] && sb === pair[0])) return true;
+    }
+    /* `toggle` fights anything deterministic aimed at the same thing. */
+    return sa === 'toggle' || sb === 'toggle';
+  }
+
+  /**
+   * Every entity a sequence commands, with the services used on each. Device
+   * targets are resolved through the registry so that a device-id action and an
+   * entity-id action on the same physical thing count as the same target.
+   */
+  function collectTargets(seq, ctx, out) {
+    out = out || { entities: new Map(), unresolved: [] };
+    if (!Array.isArray(seq)) return out;
+
+    for (const step of seq) {
+      if (!step || typeof step !== 'object' || step.enabled === false) continue;
+
+      if ('choose' in step) {
+        const branches = Array.isArray(step.choose) ? step.choose : [];
+        for (const b of branches) if (branchReachable(b, ctx)) collectTargets(b.sequence, ctx, out);
+        if (step.default) collectTargets(step.default, ctx, out);
+        continue;
+      }
+      if ('if' in step) { collectTargets(step.then, ctx, out); collectTargets(step.else, ctx, out); continue; }
+      if ('repeat' in step) { collectTargets(step.repeat && step.repeat.sequence, ctx, out); continue; }
+      if ('sequence' in step) { collectTargets(step.sequence, ctx, out); continue; }
+      if ('parallel' in step) {
+        const list = Array.isArray(step.parallel) ? step.parallel : [];
+        for (const b of list) {
+          collectTargets(Array.isArray(b) ? b : (b && b.sequence) ? b.sequence : [b], ctx, out);
+        }
+        continue;
+      }
+
+      const call = step.action || step.service;
+
+      /* A device automation step: `type: turn_on` with a device id and an
+         entity *registry* id rather than a service name. */
+      if (!call && step.type && step.device_id) {
+        const ent = ctx.byRegistryId[step.entity_id] || null;
+        addTarget(out, ent || ('device:' + step.device_id), (step.domain || 'device') + '.' + step.type, !ent);
+        continue;
+      }
+
+      if (typeof call !== 'string' || isTemplate(call)) continue;
+
+      const dot = call.indexOf('.');
+      const domain = dot > 0 ? call.slice(0, dot) : call;
+      const service = dot > 0 ? call.slice(dot + 1) : '';
+
+      /* Following a script call means its targets belong to this run too. */
+      if (domain === 'script' && service && service !== 'turn_off') {
+        const target = 'script.' + service;
+        if (ctx.stack.indexOf(target) < 0 && ctx.depth < ctx.limits.max_script_depth) {
+          const script = ctx.scripts[target];
+          if (script && script.config) {
+            collectTargets(script.config.sequence, {
+              scripts: ctx.scripts, limits: ctx.limits, byDevice: ctx.byDevice,
+              byRegistryId: ctx.byRegistryId, stack: ctx.stack.concat(target),
+              depth: ctx.depth + 1, triggerId: null,
+              timers: ctx.timers, hass: ctx.hass,
+            }, out);
+          }
+        }
+        addTarget(out, target, call, false);
+        continue;
+      }
+
+      const ents = targetEntities(step, ctx);
+      for (const e of ents) addTarget(out, e.id, call, e.unresolved);
+    }
+    return out;
+  }
+
+  function addTarget(out, id, service, unresolved) {
+    if (!id) return;
+    if (unresolved) {
+      if (out.unresolved.indexOf(id) < 0) out.unresolved.push(id);
+      return;
+    }
+    if (!out.entities.has(id)) out.entities.set(id, new Set());
+    out.entities.get(id).add(service);
+  }
+
+  /** The entities a single service call aims at, as far as is knowable. */
+  function targetEntities(step, ctx) {
+    const found = [];
+    const push = (v, unresolved) => {
+      if (typeof v !== 'string' || !v || isTemplate(v)) return;
+      found.push({ id: v, unresolved: !!unresolved });
+    };
+    const walk = (t) => {
+      if (!t) return;
+      if (typeof t === 'string') return push(t);
+      if (Array.isArray(t)) { t.forEach(walk); return; }
+      if (typeof t !== 'object') return;
+      if (t.entity_id) walk(t.entity_id);
+      if (t.device_id) {
+        const ids = Array.isArray(t.device_id) ? t.device_id : [t.device_id];
+        for (const d of ids) {
+          const ents = ctx.byDevice[d];
+          if (ents && ents.length) ents.forEach((e) => push(e));
+          else push('device:' + d, true);
+        }
+      }
+      /* An area or label target expands to whatever is in it at run time.
+         Membership is knowable, but treating it as an exact target would
+         overstate the certainty, so it is recorded as unresolved. */
+      if (t.area_id) [].concat(t.area_id).forEach((a) => push('area:' + a, true));
+      if (t.label_id) [].concat(t.label_id).forEach((l) => push('label:' + l, true));
+      if (t.floor_id) [].concat(t.floor_id).forEach((f) => push('floor:' + f, true));
+    };
+    walk(step.target);
+    walk(step.entity_id);
+    if (step.data) { walk(step.data.entity_id); walk(step.data.target); }
+    return found;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Runs
+   * ---------------------------------------------------------------- */
+
+  /**
+   * One scheduled run: a start time, an estimated length, and what it commands.
+   *
+   * A run is derived per *trigger*, not per automation, because an automation
+   * with seven time triggers has seven different schedules and - when its
+   * branches are gated on the trigger id - seven different bodies.
+   */
+  function buildRuns(automations, ctx, hass) {
+    const runs = [];
+    const dynamic = [];
+    const unanalysable = [];
+    const tooShort = [];
+
+    for (const auto of automations) {
+      const config = auto && auto.config;
+      if (!config || config.__error) {
+        unanalysable.push({ entityId: auto && auto.entityId, name: auto && auto.name, reason: 'configuration not readable' });
+        continue;
+      }
+      const triggers = [].concat(config.triggers || config.trigger || []);
+      const mode = config.mode || 'single';
+
+      triggers.forEach((trig, index) => {
+        if (!trig || typeof trig !== 'object') return;
+        const occ = triggerOccurrences(trig, hass);
+        const label = trig.alias || trig.id || ('Trigger #' + (index + 1));
+
+        if (occ.disabled) return;
+        if (occ.dynamic) {
+          dynamic.push({
+            entityId: auto.entityId, name: auto.name, label: label, kind: occ.kind || 'unknown',
+          });
+          return;
+        }
+        if (!occ.times.length) {
+          unanalysable.push({
+            entityId: auto.entityId, name: auto.name, label: label,
+            reason: occ.note || (occ.tooDense ? 'fires too often to schedule' : 'no readable time'),
+          });
+          return;
+        }
+
+        /* The body is resolved per trigger id, so a trigger-gated `choose`
+           contributes only the branch this trigger can actually reach. */
+        const runCtx = {
+          scripts: ctx.scripts, limits: ctx.limits, byDevice: ctx.byDevice,
+          byRegistryId: ctx.byRegistryId, stack: [], depth: 0,
+          triggerId: trig.id || null,
+          /* Fresh per run: one trigger's timer settings say nothing about
+             another's. */
+          timers: new Map(), hass: hass,
+        };
+        const actions = config.actions || config.action || [];
+        const duration = sequenceDuration(actions, runCtx);
+        const targets = collectTargets(actions, runCtx, null);
+
+        /* Over before anything could collide with it. Counted so the page can
+           say how many were set aside rather than quietly dropping them. */
+        if (duration.max / 60 < ctx.limits.min_runtime_minutes) {
+          tooShort.push({ entityId: auto.entityId, name: auto.name, label: label });
+          return;
+        }
+
+        for (const startMin of occ.times) {
+          runs.push({
+            entityId: auto.entityId,
+            automationId: auto.id || (config && config.id) || null,
+            name: auto.name,
+            mode: mode,
+            triggerLabel: label,
+            triggerId: trig.id || null,
+            triggerKind: occ.kind,
+            triggerIndex: index,
+            start: startMin,
+            duration: duration,
+            /* The ceiling is what matters for an overlap: the question is
+               whether the run *can* still be going when the next one starts. */
+            end: startMin + duration.max / 60,
+            targets: targets,
+            approximate: !!occ.approximate,
+            recurringPattern: !!occ.recurringPattern,
+            note: occ.note,
+          });
+        }
+      });
+    }
+    return { runs: runs, dynamic: dynamic, unanalysable: unanalysable, tooShort: tooShort };
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Pairing and severity
+   * ---------------------------------------------------------------- */
+
+  /**
+   * How many minutes the two runs are actually both in progress, allowing for a
+   * run that crosses midnight. Zero or less means no overlap.
+   *
+   * This is a true interval intersection rather than "does A's end reach B's
+   * start", because the two are not the same when both runs begin in the same
+   * minute: measuring from one end only would give a different answer depending
+   * on which run happened to be called first.
+   */
+  function overlapMinutes(a, b) {
+    const shift = b.start < a.start ? DAY_MIN : 0;
+    const bStart = b.start + shift;
+    const bEnd = b.end + shift;
+    return Math.min(a.end, bEnd) - Math.max(a.start, bStart);
+  }
+
+  /**
+   * How far before the first run's estimated finish the second one tries to
+   * start. This is a different question from how long the two overlap, and it
+   * is the one that matters when a run is going to be rejected outright: a
+   * ten-minute automation triggering 55 minutes early is 55 minutes early, no
+   * matter that it would only have run for ten.
+   */
+  function encroachMinutes(a, b) {
+    const shift = b.start < a.start ? DAY_MIN : 0;
+    return a.end - (b.start + shift);
+  }
+
+  /** Distance between two starts, the short way round the clock. */
+  function clockGap(a, b) {
+    const raw = Math.abs(a.start - b.start);
+    return Math.min(raw, DAY_MIN - raw);
+  }
+
+  /**
+   * What the two runs have in common. Shared targets are the difference
+   * between "two things happened at once" and "two things fought".
+   */
+  function sharedTargets(a, b) {
+    const shared = [];
+    let opposing = null;
+    a.targets.entities.forEach((servicesA, id) => {
+      const servicesB = b.targets.entities.get(id);
+      if (!servicesB) return;
+      const sa = Array.from(servicesA);
+      const sb = Array.from(servicesB);
+      const entry = { id: id, services: Array.from(new Set(sa.concat(sb))), opposing: false };
+      for (const x of sa) {
+        for (const y of sb) {
+          if (areOpposites(x, y)) { entry.opposing = true; opposing = { id: id, a: x, b: y }; }
+        }
+      }
+      shared.push(entry);
+    });
+    return { list: shared, opposing: opposing };
+  }
+
+  const MODE_NOTE = {
+    single: 'Home Assistant drops the second run while the first is still going, so it simply does not happen.',
+    restart: 'The second trigger cancels the run in progress and starts again from the top, so the rest of the first run is abandoned.',
+    queued: 'The second run waits for the first to finish, so it starts late rather than on time.',
+    parallel: 'Both runs execute at once.',
+  };
+
+  /**
+   * Severity, in the order the evidence actually justifies.
+   *
+   * The floor is deliberately low: two runs overlapping with nothing in common
+   * is information, not a fault. It climbs only with real evidence - a mode
+   * that drops or cancels runs, a shared target, opposing commands on it.
+   */
+  function scoreConflict(a, b, overlap, encroach, shared) {
+    const mode = a.mode;
+    const sameAutomation = a.entityId === b.entityId;
+    const reasons = [];
+    let severity = 'info';
+
+    if (overlap > 0) {
+      if (sameAutomation && mode === 'single') {
+        severity = 'critical';
+        reasons.push('The automation is `mode: single` and its own next trigger arrives ' +
+          formatMins(encroach) + ' before this run is estimated to finish. ' + MODE_NOTE.single);
+      } else if (mode === 'single' && sameAutomation === false) {
+        /* Different automations do not block each other, whatever their mode. */
+        severity = shared.list.length ? 'warning' : 'info';
+        reasons.push('The runs overlap by ' + formatMins(overlap) + '. Separate automations do not block one another, so both will run.');
+      } else if (sameAutomation && mode === 'restart') {
+        severity = 'warning';
+        reasons.push('The automation is `mode: restart` and re-triggers ' + formatMins(encroach) +
+          ' before this run is estimated to finish. ' + MODE_NOTE.restart);
+      } else if (sameAutomation && mode === 'queued') {
+        severity = 'warning';
+        reasons.push('The automation is `mode: queued`, so the second run is delayed by up to ' +
+          formatMins(encroach) + ' rather than starting on time.');
+      } else if (sameAutomation && mode === 'parallel') {
+        severity = shared.list.length ? 'warning' : 'info';
+        reasons.push('The automation is `mode: parallel`, so both runs execute at once.');
+      } else {
+        reasons.push('The runs overlap by ' + formatMins(overlap) + '.');
+      }
+    } else {
+      reasons.push('The triggers are ' + formatMins(clockGap(a, b)) + ' apart; neither run is estimated to still be going when the other starts.');
+    }
+
+    /* Shared targets are what turn a coincidence into a conflict. */
+    if (shared.list.length && overlap > 0) {
+      if (shared.opposing) {
+        severity = 'critical';
+        reasons.push('Both runs command `' + shared.opposing.id + '` while overlapping, and `' +
+          shared.opposing.a + '` and `' + shared.opposing.b + '` undo each other.');
+      } else if (severity === 'info') {
+        severity = 'warning';
+        reasons.push('Both runs command ' + shared.list.length +
+          (shared.list.length === 1 ? ' shared entity' : ' shared entities') + ' while overlapping.');
+      } else {
+        reasons.push('Both runs command ' + shared.list.length +
+          (shared.list.length === 1 ? ' shared entity' : ' shared entities') + ' while overlapping.');
+      }
+    }
+
+    return { severity: severity, reasons: reasons };
+  }
+
+  function formatMins(mins) {
+    const m = Math.round(mins);
+    if (m < 1) return 'under a minute';
+    if (m < 60) return m + ' min';
+    const h = Math.floor(m / 60);
+    const rest = m % 60;
+    return h + 'h' + (rest ? ' ' + rest + 'm' : '');
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The analysis
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Compares every analysable scheduled run against every other and reports
+   * the pairs that can get in each other's way.
+   *
+   * Times are handled as minutes past midnight rather than as dates, which is
+   * what makes a daily collision one finding instead of one per day.
+   */
+  function analyseConflicts(sources, index, hass, cfg) {
+    const limits = Object.assign({}, DEFAULT_CONFLICTS, (cfg && cfg.conflicts) || {});
+
+    const scripts = {};
+    for (const s of sources.scripts || []) scripts[s.entityId] = s;
+
+    /* Device id -> its entity ids, and entity registry id -> entity id, so a
+       device-targeted action and an entity-targeted one on the same thing are
+       recognised as the same target. */
+    const byDevice = {};
+    const byRegistryId = {};
+    for (const reg of (index && index.registryList) || []) {
+      if (reg.device_id) {
+        if (!byDevice[reg.device_id]) byDevice[reg.device_id] = [];
+        byDevice[reg.device_id].push(reg.entity_id);
+      }
+      if (reg.id) byRegistryId[reg.id] = reg.entity_id;
+    }
+
+    const built = buildRuns(sources.automations || [], { scripts: scripts, limits: limits, byDevice: byDevice, byRegistryId: byRegistryId }, hass);
+    const runs = built.runs;
+
+    const conflicts = [];
+    for (let i = 0; i < runs.length; i++) {
+      for (let j = i + 1; j < runs.length; j++) {
+        const pair = orderRuns(runs[i], runs[j]);
+        const first = pair[0];
+        const second = pair[1];
+
+        /* A run never conflicts with itself. */
+        if (first === second) continue;
+        if (first.entityId === second.entityId &&
+            first.triggerIndex === second.triggerIndex &&
+            first.start === second.start) continue;
+
+        const overlap = overlapMinutes(first, second);
+        const encroach = encroachMinutes(first, second);
+        const gap = clockGap(first, second);
+        const near = gap <= limits.near_minutes;
+
+        if (overlap <= 0 && !near) continue;
+
+        /* An unknown runtime cannot prove an overlap. A near-collision still
+           stands on its own, because it needs no runtime at all. */
+        if (overlap > 0 && first.duration.unknown && first.duration.max === 0) {
+          if (!near) continue;
+        }
+
+        const shared = sharedTargets(first, second);
+        const scored = scoreConflict(first, second, overlap, encroach, shared);
+
+        conflicts.push({
+          key: [first.entityId, first.triggerIndex, first.start, second.entityId, second.triggerIndex, second.start].join('|'),
+          severity: scored.severity,
+          reasons: scored.reasons,
+          internal: first.entityId === second.entityId,
+          exact: Math.abs(gap) < 0.5,
+          near: near && overlap <= 0,
+          overlap: overlap > 0 ? overlap : 0,
+          /* How early the second trigger is - the number that matters when the
+             run is going to be dropped or restarted. */
+          encroach: encroach > 0 ? encroach : 0,
+          gap: gap,
+          shared: shared.list,
+          opposing: shared.opposing,
+          first: runSummary(first),
+          second: runSummary(second),
+          approximate: first.approximate || second.approximate,
+          runtimeUnknown: first.duration.unknown || second.duration.unknown,
+          runtimeReasons: Array.from(new Set(first.duration.reasons.concat(second.duration.reasons))),
+        });
+      }
+    }
+
+    /* Worst first, then the biggest overlap, then by time so the order is
+       stable between scans. */
+    const rank = { critical: 0, warning: 1, info: 2 };
+    conflicts.sort((x, y) =>
+      rank[x.severity] - rank[y.severity] ||
+      y.overlap - x.overlap ||
+      x.first.start - y.first.start);
+
+    const counts = { critical: 0, warning: 0, info: 0 };
+    for (const c of conflicts) counts[c.severity]++;
+
+    return {
+      ready: true,
+      analysedAt: Date.now(),
+      conflicts: conflicts,
+      counts: counts,
+      /* Only these two are worth interrupting someone's main dashboard for. */
+      actionable: counts.critical + counts.warning,
+      scanned: {
+        automations: (sources.automations || []).length,
+        runs: runs.length,
+        dynamic: built.dynamic.length,
+        unanalysable: built.unanalysable.length,
+        tooShort: built.tooShort.length,
+      },
+      dynamic: built.dynamic,
+      unanalysable: built.unanalysable,
+      tooShort: built.tooShort,
+      runs: runs.map(runSummary),
+    };
+  }
+
+  /** Earlier start first, so "first" and "second" mean what they say. */
+  function orderRuns(a, b) {
+    if (a.start < b.start) return [a, b];
+    if (b.start < a.start) return [b, a];
+    /* Same minute: keep a stable order so the key does not flip between scans. */
+    return a.entityId <= b.entityId ? [a, b] : [b, a];
+  }
+
+  function runSummary(run) {
+    return {
+      entityId: run.entityId,
+      automationId: run.automationId,
+      name: run.name,
+      mode: run.mode,
+      triggerLabel: run.triggerLabel,
+      triggerId: run.triggerId,
+      triggerKind: run.triggerKind,
+      start: run.start,
+      startClock: minutesToClock(run.start),
+      endClock: minutesToClock(run.end),
+      durationMin: run.duration.max / 60,
+      durationMinFloor: run.duration.min / 60,
+      durationUnknown: run.duration.unknown,
+      /* Derived from something real - a timer's configured length - rather than
+         read straight off a delay, and labelled so on the card. */
+      durationEstimated: !!run.duration.estimated,
+      durationReasons: Array.from(new Set(run.duration.reasons)),
+      targetCount: run.targets.entities.size,
+      targets: Array.from(run.targets.entities.keys()),
+      unresolvedTargets: run.targets.unresolved,
+      approximate: run.approximate,
+      note: run.note,
+    };
+  }
+
   /**
    * Gathers everything and runs the inspection. The full entity registry is
    * fetched here rather than reused from `hass.entities`, because the
@@ -1745,12 +2967,17 @@
     ]);
 
     const index = buildIndex(hass, { registry, manifests: cfg.manifests });
+    index.registryList = registry || [];
     const model = inspectConfiguration(
       { automations, scripts, scenes, dashboards, resources },
       index,
       { isDefined: (tag) => !!window.customElements.get(tag) }
     );
     model.hasRegistry = !!registry;
+    /* The conflict analysis rides the same fetch: every automation and script
+       configuration it needs has just been read for the inspector, so this
+       costs no extra round trips. */
+    model.conflicts = analyseConflicts({ automations, scripts }, index, hass, cfg);
     model.scannedAt = Date.now();
     return model;
   }
@@ -1897,6 +3124,136 @@
    * makes the tile disappear entirely rather than sit there saying "0".
    * ================================================================== */
 
+  /**
+   * The conflicts tile. Only critical and warning raise it: an `info` finding
+   * is a schedule that happens to coincide, which is worth knowing on the full
+   * page and is emphatically not worth a red tile on a main dashboard.
+   */
+  function conflictsCompact(con) {
+    if (!con || !con.ready || !con.counts) return null;
+    const c = con.counts;
+    if (!c.critical && !c.warning) return null;
+
+    const worst = con.conflicts.find((x) => x.severity === 'critical')
+      || con.conflicts.find((x) => x.severity === 'warning');
+    const bits = [];
+    if (c.critical) bits.push(c.critical + ' critical');
+    if (c.warning) bits.push(c.warning + ' warning');
+
+    return {
+      band: c.critical ? 'critical' : 'warn',
+      icon: 'mdi:calendar-alert',
+      count: c.critical + c.warning,
+      label: 'Conflicts',
+      /* The worst one by name, because "2 critical" tells you there is a
+         problem and this tells you where to look. */
+      detail: worst
+        ? worst.first.name + ' · ' + worst.first.startClock + ' ↔ ' + worst.second.startClock
+        : bits.join(' · '),
+    };
+  }
+
+
+  /**
+   * One card for the whole house, for a main dashboard.
+   *
+   * Three separate tiles answered three questions, which is right on the Health
+   * page and wrong on a dashboard you only glance at. What belongs there is a
+   * verdict and a short list of what is behind it, grouped the same way the
+   * Health page groups them - devices, configuration, conflicts - so the list
+   * reads as a table of contents for the page it links to.
+   *
+   * Only groups with something in them appear, and the card is absent entirely
+   * while everything is fine. A list of zeroes is what makes a status card
+   * ignorable.
+   */
+  function overallCompact(model) {
+    const c = model.counts || {};
+    const conf = model.config;
+    const con = model.conflicts;
+
+    const num = (v) => v || 0;
+    const line = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+
+    const groups = [];
+
+    const device = [];
+    if (num(c.offline)) device.push(line(c.offline, 'offline', 'offline'));
+    if (num(c.degraded)) device.push(line(c.degraded, 'degraded', 'degraded'));
+    if (num(c.unknown)) device.push(line(c.unknown, 'unknown', 'unknown'));
+    if (num(c.lowBattery)) device.push(line(c.lowBattery, 'low battery', 'low batteries'));
+    if (device.length) {
+      groups.push({
+        key: 'devices', label: 'Devices', items: device,
+        band: c.offline ? 'critical' : c.degraded ? 'warn' : c.unknown ? 'unknown' : 'battery',
+        serious: num(c.offline),
+      });
+    }
+
+    const cfg = [];
+    if (conf && conf.counts) {
+      if (num(conf.counts.brokenItems)) cfg.push(line(conf.counts.brokenItems, 'broken item', 'broken items'));
+      if (num(conf.counts.warnings)) cfg.push(line(conf.counts.warnings, 'warning', 'warnings'));
+    }
+    if (cfg.length) {
+      groups.push({
+        key: 'config', label: 'Configuration', items: cfg,
+        band: conf.counts.brokenItems ? 'critical' : 'warn',
+        serious: num(conf.counts.brokenItems),
+      });
+    }
+
+    const clash = [];
+    if (con && con.counts) {
+      if (num(con.counts.critical)) clash.push(line(con.counts.critical, 'critical', 'critical'));
+      if (num(con.counts.warning)) clash.push(line(con.counts.warning, 'warning', 'warnings'));
+    }
+    if (clash.length) {
+      groups.push({
+        key: 'conflicts', label: 'Conflicts', items: clash,
+        band: con.counts.critical ? 'critical' : 'warn',
+        serious: num(con.counts.critical),
+      });
+    }
+
+    if (!groups.length) return null;
+
+    /* Anything that stops something working outright earns the stronger word;
+       the rest is worth knowing but not worth alarm. */
+    const serious = groups.some((g) => g.serious);
+    const look = HOUSE_STATES[serious ? 'critical' : 'warn'];
+
+    return {
+      band: look.band,
+      icon: look.icon,
+      word: look.word,
+      groups: groups,
+      total: groups.reduce((sum, g) => sum + g.items.length, 0),
+    };
+  }
+
+  function overallHtml(view, nav) {
+    const tag = nav ? 'button' : 'div';
+    return (
+      '<ha-card class="mini overall">' +
+      '<' + tag + ' class="ocard band-' + view.band + (nav ? ' is-tappable' : '') + '"' +
+      (nav ? ' type="button" data-nav="' + esc(nav) + '"' : '') + '>' +
+      '<div class="ohead">' +
+      '<ha-icon class="hicon" icon="' + esc(view.icon) + '"></ha-icon>' +
+      '<span class="hword">' + esc(view.word) + '</span>' +
+      '</div>' +
+      '<div class="ogroups">' +
+      view.groups.map((g) =>
+        '<div class="ogroup band-' + g.band + '">' +
+        '<span class="odot"></span>' +
+        '<span class="olabel">' + esc(g.label) + '</span>' +
+        '<span class="oitems">' + esc(g.items.join(' · ')) + '</span>' +
+        '</div>').join('') +
+      '</div>' +
+      '</' + tag + '></ha-card>'
+    );
+  }
+
   /** Plural helper: `n` things, with the noun agreeing. */
   const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many || one + 's');
 
@@ -1915,11 +3272,36 @@
    */
   const compactPeers = new Set();
 
-  function peerHasProblem(except) {
-    for (const card of compactPeers) {
-      if (card !== except && card._compactHasProblem) return true;
+  /* The order tiles are filled in when one has to be borrowed to complete a
+     row. Devices first because it is the one people look at without being
+     prompted. */
+  const COMPACT_ORDER = ['device-compact', 'configuration-compact', 'conflicts-compact'];
+
+  /**
+   * Which of the group's tiles are on screen.
+   *
+   * A tile takes half a row, so a lone one leaves the other half to whatever
+   * unrelated card follows it. The group therefore shows an even two: every
+   * tile that has something to report, and - if that is only one - the next
+   * quiet tile to fill the row beside it. A third quiet tile would only add an
+   * orphaned half-row of its own, so it stays away.
+   *
+   * When all of them have something to say, all of them are shown: dropping one
+   * to keep the row tidy would be hiding a real problem.
+   */
+  function visibleCompactModes() {
+    const present = COMPACT_ORDER.filter((mode) =>
+      [...compactPeers].some((card) => card._config && card._config.mode === mode));
+    const shown = new Set(
+      present.filter((mode) =>
+        [...compactPeers].some((card) => card._config && card._config.mode === mode && card._compactHasProblem))
+    );
+    if (!shown.size) return shown;
+    for (const mode of present) {
+      if (shown.size >= 2) break;
+      shown.add(mode);
     }
-    return false;
+    return shown;
   }
 
   /** The grey half of the pair: present only to keep the row whole. */
@@ -1929,6 +3311,14 @@
       return {
         zero: true, band: 'ok', icon: 'mdi:heart-outline', count: 0,
         label: 'Devices', detail: n ? n + ' online' : 'All online',
+      };
+    }
+    if (mode === 'conflicts-compact') {
+      const con = model.conflicts;
+      return {
+        zero: true, band: 'ok', icon: 'mdi:calendar-check', count: 0,
+        label: 'Conflicts',
+        detail: con && con.ready ? 'No schedule clashes' : 'Checking…',
       };
     }
     const conf = model.config;
@@ -2113,7 +3503,8 @@
     return sectionHtml('Device status', c.population + ' devices monitored', '<div class="pills">' + pills + '</div>', 'sec-summary');
   }
 
-  /* ---- house health -------------------------------------------------
+  
+/* ---- house health -------------------------------------------------
    *
    * One line at the top that answers the question before any of the detail
    * does. It deliberately reads the runtime and the configuration halves
@@ -2354,6 +3745,205 @@
     );
   }
 
+
+  /* ---- automation conflicts ----
+     Same components as the sections above it: `sec` card, `chips` filter row,
+     `prob` expandable rows. Only the contents of a row are new. */
+
+  const CONFLICT_BAND = { critical: 'critical', warning: 'warn', info: 'unknown' };
+  const CONFLICT_DOT = { critical: '🔴', warning: '🟠', info: '⚪' };
+  const CONFLICT_WORD = { critical: 'Critical', warning: 'Warning', info: 'Info' };
+
+  function conflictChips(list) {
+    return [
+      { id: 'all', label: 'All', n: list.length },
+      { id: 'critical', label: 'Critical', n: list.filter((c) => c.severity === 'critical').length },
+      { id: 'warning', label: 'Warning', n: list.filter((c) => c.severity === 'warning').length },
+      { id: 'internal', label: 'Internal', n: list.filter((c) => c.internal).length },
+      { id: 'cross', label: 'Cross', n: list.filter((c) => !c.internal).length },
+    ].filter((c) => c.n || c.id === 'all');
+  }
+
+  const matchesConflictChip = (c, chip) =>
+    chip === 'all' ? true
+      : chip === 'internal' ? c.internal
+        : chip === 'cross' ? !c.internal
+          : c.severity === chip;
+
+  /** "05:00 ─── 05:55" against "05:50 ─── 06:00", as one readable line. */
+  function windowHtml(run) {
+    const len = run.durationUnknown && !run.durationMin
+      ? 'runtime unknown'
+      : Math.round(run.durationMin) + ' min' + (run.durationEstimated ? ' est' : '');
+    return (
+      '<span class="cwin">' +
+      '<span class="ctime">' + esc(run.startClock) + '</span>' +
+      '<span class="cbar"></span>' +
+      '<span class="ctime">' + esc(run.endClock) + '</span>' +
+      '<span class="clen">' + esc(len) + '</span>' +
+      '</span>'
+    );
+  }
+
+  function conflictRunDetail(run, label) {
+    const bits = [];
+    bits.push('<div class="crow"><span class="ck">' + esc(label) + '</span><span class="cv">' +
+      esc(run.name) + ' · ' + esc(run.triggerLabel) + '</span></div>');
+    bits.push('<div class="crow"><span class="ck">Trigger</span><span class="cv">' +
+      esc(run.triggerKind) + (run.triggerId ? ' · id ' + esc(run.triggerId) : '') +
+      (run.note ? ' · ' + esc(run.note) : '') + '</span></div>');
+    bits.push('<div class="crow"><span class="ck">Scheduled</span><span class="cv">' +
+      esc(run.startClock) + ' → ' + esc(run.endClock) + '</span></div>');
+    bits.push('<div class="crow"><span class="ck">Runtime</span><span class="cv">' +
+      (run.durationUnknown && !run.durationMin
+        ? 'unknown'
+        : Math.round(run.durationMin) + ' min' + (run.durationEstimated ? ' (estimated)' : '')) +
+      (run.durationReasons.length ? ' — ' + esc(run.durationReasons.join('; ')) : '') +
+      '</span></div>');
+    bits.push('<div class="crow"><span class="ck">Mode</span><span class="cv mono">' + esc(run.mode) + '</span></div>');
+    if (run.targetCount) {
+      bits.push('<div class="crow"><span class="ck">Commands</span><span class="cv mono">' +
+        esc(run.targets.slice(0, 8).join(', ')) +
+        (run.targets.length > 8 ? ' +' + (run.targets.length - 8) + ' more' : '') + '</span></div>');
+    }
+    if (run.unresolvedTargets.length) {
+      bits.push('<div class="crow"><span class="ck">Also aims at</span><span class="cv mono">' +
+        esc(run.unresolvedTargets.join(', ')) + ' (membership resolved at run time)</span></div>');
+    }
+    return bits.join('');
+  }
+
+  function conflictItemHtml(c, open) {
+    const band = CONFLICT_BAND[c.severity];
+    const headline = c.internal
+      ? c.first.name
+      : c.first.name + ' ↔ ' + c.second.name;
+    const sub = c.internal ? 'Internal · ' + esc(c.first.mode) : 'Cross-automation · ' + esc(c.first.mode);
+    /* The badge shows whatever the reason talks about: when a run is going to
+       be dropped or restarted that is how early the next trigger is, not how
+       long the two would have overlapped. */
+    const badgeMins = c.internal && c.encroach > c.overlap ? c.encroach : c.overlap;
+    const right = badgeMins > 0 ? Math.round(badgeMins) + 'm' : c.exact ? 'same' : Math.round(c.gap) + 'm';
+
+    return (
+      '<div class="prob conflict band-' + band + (open ? ' is-open' : '') + '">' +
+      '<button class="probhead" type="button" data-toggle="' + esc(c.key) + '" aria-expanded="' + (open ? 'true' : 'false') + '">' +
+      '<span class="picon cdot">' + CONFLICT_DOT[c.severity] + '</span>' +
+      '<span class="ptext">' +
+      '<span class="pname">' + esc(headline) + '</span>' +
+      '<span class="pmeta">' + sub + '</span>' +
+      '<span class="cwins">' + windowHtml(c.first) + windowHtml(c.second) + '</span>' +
+      '<span class="ploc">' + esc(c.first.triggerLabel) + ' ↔ ' + esc(c.second.triggerLabel) +
+      (c.shared.length ? ' · ' + c.shared.length + ' shared target' + (c.shared.length === 1 ? '' : 's') : '') +
+      '</span></span>' +
+      '<span class="pright"><span class="pstatus">' + esc(right) + '</span></span>' +
+      '<ha-icon class="pchev" icon="mdi:chevron-down"></ha-icon></button>' +
+      (open
+        ? '<div class="details">' +
+          '<div class="creasons">' + c.reasons.map((r) =>
+            '<div class="creason">' + esc(r) + '</div>').join('') + '</div>' +
+          '<div class="cdetail">' +
+          conflictRunDetail(c.first, 'First run') +
+          '<div class="csep"></div>' +
+          conflictRunDetail(c.second, 'Second run') +
+          '</div>' +
+          (c.shared.length
+            ? '<div class="cshared"><span class="ck">Shared targets</span>' +
+              c.shared.map((t) =>
+                '<div class="ctarget' + (t.opposing ? ' is-opposing' : '') + '">' +
+                '<span class="mono">' + esc(t.id) + '</span>' +
+                '<span class="cserv">' + esc(t.services.join(' · ')) + '</span>' +
+                (t.opposing ? '<span class="cflag">opposing</span>' : '') +
+                '</div>').join('') + '</div>'
+            : '') +
+          (c.approximate
+            ? '<div class="cnote">One of these is a sun-based trigger, so the times shift a little each day.</div>'
+            : '') +
+          '<div class="clinks">' +
+          conflictLink(c.first) + (c.internal ? '' : conflictLink(c.second)) +
+          '</div>' +
+          '</div>'
+        : '') +
+      '</div>'
+    );
+  }
+
+  /**
+   * Opens the automation's own editor. The numeric id comes from the fetched
+   * configuration rather than from the entity id, because the two are unrelated:
+   * `automation.evening_lights` is edited at `/config/automation/edit/1712…`.
+   */
+  function conflictLink(run) {
+    if (!run.automationId) {
+      return '<button class="devbtn" type="button" data-entity="' + esc(run.entityId) + '">' +
+        '<ha-icon icon="mdi:information-outline"></ha-icon>Open ' + esc(run.name) + '</button>';
+    }
+    return '<button class="devbtn" type="button" data-nav="/config/automation/edit/' + esc(run.automationId) + '">' +
+      '<ha-icon icon="mdi:pencil-outline"></ha-icon>Edit ' + esc(run.name) + '</button>';
+  }
+
+  function conflictsSection(model, state) {
+    const con = model.conflicts;
+    if (!con) return '';
+    if (!con.ready) {
+      return sectionHtml('Automation conflicts', '',
+        '<div class="scanning"><ha-icon icon="mdi:progress-clock"></ha-icon>' +
+        '<span>Reading automation schedules…</span></div>', 'sec-conflicts');
+    }
+
+    const checked = 'Last checked ' + clockOf(con.analysedAt);
+    const scanned = con.scanned.runs + ' scheduled run' + (con.scanned.runs === 1 ? '' : 's') +
+      ' across ' + con.scanned.automations + ' automations';
+
+    if (!con.conflicts.length) {
+      return sectionHtml('Automation conflicts', checked,
+        '<div class="allgood"><ha-icon icon="mdi:check-circle-outline"></ha-icon>' +
+        '<span><strong>No automation conflicts detected</strong>' +
+        '<small>' + esc(scanned) + '. No two scheduled runs are estimated to overlap.</small></span></div>',
+        'sec-conflicts');
+    }
+
+    /* Info on its own is worth knowing but is not a fault, so the section says
+       so rather than showing a red count of things that are fine. */
+    const c = con.counts;
+    const headline = [];
+    if (c.critical) headline.push(c.critical + ' critical');
+    if (c.warning) headline.push(c.warning + ' warning');
+    if (c.info) headline.push(c.info + ' info');
+
+    const chip = state.conflictChip || 'all';
+    const shown = con.conflicts.filter((x) => matchesConflictChip(x, chip));
+
+    return sectionHtml('Automation conflicts', headline.join(' · ') + ' · ' + checked,
+      chipsHtml(conflictChips(con.conflicts), chip, 'confl') +
+      '<div class="list">' +
+      shown.map((x) => conflictItemHtml(x, state.open.has(x.key))).join('') +
+      '</div>' +
+      '<div class="cfoot">' +
+      '<span>' + esc(scanned) + '</span>' +
+      (con.scanned.dynamic
+        ? '<span>' + con.scanned.dynamic + ' dynamic trigger' + (con.scanned.dynamic === 1 ? '' : 's') +
+          ' not schedulable</span>'
+        : '') +
+      (con.scanned.unanalysable
+        ? '<span>' + con.scanned.unanalysable + ' trigger' + (con.scanned.unanalysable === 1 ? '' : 's') +
+          ' could not be read</span>'
+        : '') +
+      (con.scanned.tooShort
+        ? '<span>' + con.scanned.tooShort + ' run' + (con.scanned.tooShort === 1 ? '' : 's') +
+          ' under a minute, not compared</span>'
+        : '') +
+      '<button class="rescan" type="button" data-rescan="1">' +
+      '<ha-icon icon="mdi:refresh"></ha-icon>Refresh</button>' +
+      '</div>',
+      'sec-conflicts');
+  }
+
+  const clockOf = (ms) => {
+    const d = new Date(ms);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  };
+
   function configSection(model, state) {
     const conf = model.config;
     if (!conf || !conf.ready) return '';
@@ -2501,9 +4091,18 @@
       'title="Open this device in Settings">' +
       '<ha-icon icon="mdi:cog-outline"></ha-icon><span>Device</span></button>';
 
+    /* Sits beside the device button because it answers the same question -
+       "this one is not really broken" - and the reader is already here having
+       decided that. */
+    const skipButton =
+      '<button class="devbtn" type="button" data-skip="' + esc(p.deviceId) + '" ' +
+      'title="Stop reporting the health of this device">' +
+      '<ha-icon icon="mdi:eye-off-outline"></ha-icon><span>Skip</span></button>';
+
     return (
       '<div class="details">' +
-      '<div class="dtop"><div class="dfacts">' + facts.join('') + '</div>' + deviceButton + '</div>' +
+      '<div class="dtop"><div class="dfacts">' + facts.join('') + '</div>' +
+      '<div class="dbtns">' + deviceButton + skipButton + '</div></div>' +
       '<div class="ents">' + rows + '</div></div>'
     );
   }
@@ -2594,6 +4193,43 @@
       'last ' + Math.round(cfg.recovery_minutes / 60) + 'h',
       '<div class="recs">' + rows + '</div>',
       'sec-deleted'
+    );
+  }
+
+  /**
+   * Every device the user has told the card to leave alone. Hidden entirely
+   * when there is nothing skipped, like every other section here.
+   *
+   * Each row says what the skip is currently suppressing, so the list can be
+   * reviewed rather than just accumulated - a device skipped a year ago that
+   * is now genuinely dead should be easy to notice.
+   */
+  function skippedSection(model) {
+    if (!model.skipped || !model.skipped.length) return '';
+    const rows = model.skipped.map((d) => {
+      const state = d.wouldBe
+        ? '<span class="skipwould band-' + d.wouldBe.band + '">' + esc(d.wouldBe.label) + '</span>'
+        : '<span class="skipok">Responding</span>';
+      const bits = [esc(d.integration)];
+      if (d.area) bits.push(esc(d.area));
+      return (
+        '<div class="rec is-skipped">' +
+        '<ha-icon icon="mdi:eye-off-outline"></ha-icon>' +
+        '<span class="rectext"><span class="recname">' + esc(d.name) + '</span>' +
+        '<span class="recmeta">' + bits.join(' &middot; ') + '</span></span>' +
+        state +
+        '<button class="devbtn skipundo" type="button" data-unskip="' + esc(d.deviceId) + '" ' +
+        'title="Check this device again">' +
+        '<ha-icon icon="mdi:eye-outline"></ha-icon><span>Un-skip</span></button>' +
+        '</div>'
+      );
+    }).join('');
+    const n = model.skipped.length;
+    return sectionHtml(
+      'Skipped devices',
+      n + (n === 1 ? ' device not checked' : ' devices not checked'),
+      '<div class="recs recs-skipped">' + rows + '</div>',
+      'sec-skipped'
     );
   }
 
@@ -2736,6 +4372,83 @@ ha-card.mini .pnote {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 @container dhpill (max-width: 110px) { ha-card.mini .pnote { display: none; } }
+
+
+/* ---- the overall card ----
+   The Health page's verdict row, followed by one line per group that has
+   something in it. Same words, same colours, a third of the height. */
+ha-card.mini.overall { overflow: hidden; }
+.ocard {
+  display: block; width: 100%; padding: 10px 12px 11px; border: 0;
+  border-radius: var(--ha-card-border-radius, 12px);
+  font: inherit; color: inherit; text-align: left; cursor: default;
+  background: color-mix(in srgb, var(--dh-accent) 12%, transparent);
+}
+.ocard.is-tappable { cursor: pointer; }
+.ocard.is-tappable:hover { background: color-mix(in srgb, var(--dh-accent) 20%, transparent); }
+.ohead { display: flex; align-items: center; gap: 9px; }
+.ocard .hicon { --mdc-icon-size: 24px; color: var(--dh-accent); }
+.ocard .hword { font-size: 0.95rem; font-weight: 700; color: var(--primary-text-color); }
+.ogroups { display: flex; flex-direction: column; gap: 3px; margin: 7px 0 0 33px; }
+.ogroup { display: grid; grid-template-columns: 7px minmax(64px, auto) minmax(0, 1fr); align-items: baseline; gap: 8px; }
+.odot { width: 6px; height: 6px; border-radius: 50%; background: var(--dh-accent); transform: translateY(-1px); }
+.olabel { font-size: 0.73rem; font-weight: 600; color: var(--primary-text-color); }
+.oitems { font-size: 0.73rem; color: var(--secondary-text-color); overflow-wrap: anywhere; }
+/* On a narrow card the group name sits above its counts rather than beside. */
+@container dhcard (max-width: 300px) {
+  .ogroups { margin-left: 0; }
+  .ogroup { grid-template-columns: 7px minmax(0, 1fr); }
+  .oitems { grid-column: 2; }
+}
+
+/* ---- automation conflicts ----
+   The two execution windows are the point of a conflict row, so they get a
+   line of their own rather than being buried in the detail panel. */
+.cwins { display: flex; flex-direction: column; gap: 2px; margin: 3px 0 1px; }
+.cwin { display: flex; align-items: center; gap: 6px; font-size: 0.72rem; }
+.ctime { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--primary-text-color); }
+.cbar {
+  flex: 1 1 auto; min-width: 14px; max-width: 120px; height: 2px; border-radius: 1px;
+  background: color-mix(in srgb, var(--dh-accent) 55%, transparent);
+}
+.clen { color: var(--secondary-text-color); font-size: 0.68rem; white-space: nowrap; }
+.creasons { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.creason {
+  font-size: 0.76rem; line-height: 1.45; padding: 7px 9px; border-radius: 8px;
+  background: color-mix(in srgb, var(--dh-accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--dh-accent) 25%, transparent);
+}
+.cdetail { display: flex; flex-direction: column; gap: 3px; }
+.crow { display: grid; grid-template-columns: minmax(88px, auto) minmax(0, 1fr); gap: 8px; font-size: 0.74rem; }
+.ck { color: var(--secondary-text-color); }
+.cv { color: var(--primary-text-color); overflow-wrap: anywhere; }
+.csep { height: 1px; background: var(--divider-color); margin: 6px 0; }
+.cshared { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.ctarget {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px;
+  font-size: 0.72rem; padding: 5px 8px; border-radius: 7px;
+  background: var(--dh-soft); border: 1px solid var(--divider-color);
+}
+.ctarget.is-opposing { border-color: color-mix(in srgb, var(--error-color) 45%, transparent); }
+.cserv { color: var(--secondary-text-color); }
+.cflag {
+  font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--error-color);
+}
+.cnote { margin-top: 8px; font-size: 0.72rem; color: var(--secondary-text-color); }
+.clinks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.cfoot {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin-top: 10px;
+  font-size: 0.7rem; color: var(--secondary-text-color);
+}
+.cfoot .rescan { margin-left: auto; }
+/* Narrow cards put the windows under the name rather than squeezing them. */
+@container dhcard (max-width: 360px) {
+  .cbar { max-width: 40px; }
+  .clen { font-size: 0.64rem; }
+  .crow { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .ck { font-size: 0.68rem; }
+}
 
 /* ---- house health ----
    One row that must survive 304px, so the stat chips wrap under the verdict
@@ -2944,6 +4657,28 @@ ha-card.mini .pnote {
 .recmeta { font-size: 0.68rem; color: var(--secondary-text-color);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recage { font-size: 0.72rem; color: var(--success-color, #43a047); white-space: nowrap; font-weight: 600; }
+/* Two buttons where there was one: they stack rather than squeeze the facts
+   column, which is the part that has to stay readable. */
+.dbtns { display: flex; flex-direction: column; gap: 4px; align-items: stretch; }
+/* .devbtn carries align-self: start for its solo uses; stacked, the two have
+   to share an edge or the pair reads as an accident. */
+.dbtns .devbtn { justify-content: center; align-self: stretch; }
+.devbtn.is-busy { opacity: 0.5; pointer-events: none; }
+.devbtn.is-failed { border-color: var(--error-color, #db4437); color: var(--error-color, #db4437); }
+/* A skipped row is a record, not an alert: neutral, with the suppressed
+   verdict shown in its own colour so a skip that now hides a real fault is
+   still legible. */
+.recs-skipped .rec { grid-template-columns: 22px minmax(0, 1fr) auto auto; gap: 8px; }
+.rec.is-skipped ha-icon { color: var(--secondary-text-color); }
+.rec.is-skipped .recname { color: var(--primary-text-color); }
+.skipwould { font-size: 0.72rem; font-weight: 700; color: var(--dh-accent); white-space: nowrap; }
+.skipok { font-size: 0.72rem; font-weight: 600; color: var(--success-color, #43a047); white-space: nowrap; }
+.skipundo { padding: 2px 8px; font-size: 0.68rem; }
+.skipundo ha-icon { --mdc-icon-size: 14px; }
+@container dhcard (max-width: 420px) {
+  .recs-skipped .rec { grid-template-columns: 22px minmax(0, 1fr) auto; }
+  .recs-skipped .skipundo { grid-column: 2 / -1; justify-self: start; }
+}
 .recage-n { font-variant-numeric: tabular-nums; }
 /* Deletion is neither a failure nor a recovery, so it borrows neither colour. */
 .rec.is-deleted ha-icon { color: var(--secondary-text-color); }
@@ -3136,11 +4871,13 @@ ha-card.mini .pnote {
         recovery_minutes: c.recovery_minutes === undefined ? DEFAULT_RECOVERY_MINUTES : Number(c.recovery_minutes),
         ignored_domains: c.ignored_domains || DEFAULT_IGNORED_DOMAINS,
         exclude_integrations: c.exclude_integrations || DEFAULT_EXCLUDED_INTEGRATIONS,
+        skip_label: c.skip_label || DEFAULT_SKIP_LABEL,
+        exclude_devices: c.exclude_devices || [],
         exclude: c.exclude || [],
         cluster: Object.assign({}, DEFAULT_CLUSTER, c.cluster || {}),
         manifests: {},
       };
-      this._state = { chip: 'all', confChip: 'all', open: new Set() };
+      this._state = { chip: 'all', confChip: 'all', conflictChip: 'all', open: new Set() };
       this._signature = null;
       /* setConfig can arrive after connectedCallback, so registration happens
          in whichever runs second. */
@@ -3237,6 +4974,10 @@ ha-card.mini .pnote {
        section, and drop to a whole row of their own when the section narrows -
        the same shape the battery tiles on that dashboard already use. */
     getGridOptions() {
+      if (this._config.mode === 'overall-compact') {
+        /* A grouped list needs the width of a row, not half of one. */
+        return { rows: 'auto', columns: 'full', min_columns: 6, min_rows: 1 };
+      }
       if (isCompact(this._config.mode)) {
         return { rows: 'auto', columns: 6, min_columns: 3, min_rows: 1 };
       }
@@ -3260,7 +5001,10 @@ ha-card.mini .pnote {
       /* The configuration tile shows nothing that any state change can alter,
          so it opts out of the state-driven pipeline entirely and rebuilds only
          when the scan itself produces a new answer. */
-      if (this._config.mode === 'configuration-compact') {
+      const mode = this._config.mode;
+      /* The overall card reads the runtime model too, so it stays on the
+         state-driven path and only the configuration-only tiles opt out. */
+      if (mode === 'configuration-compact' || mode === 'conflicts-compact') {
         if (!this._model) this._build();
         else this._scanConfig(false);
         return;
@@ -3308,7 +5052,8 @@ ha-card.mini .pnote {
       /* The configuration tile has no use for the runtime model, and running
          the whole device analysis for it would be 15ms of wasted work on every
          state change in the install. */
-      const model = mode === 'configuration-compact'
+      const noRuntime = mode === 'configuration-compact' || mode === 'conflicts-compact';
+      const model = noRuntime
         ? { problems: [], lowBatteries: [], counts: {}, _now: now }
         : analyse(this._hass, this._config, now);
       model.batteryThreshold = this._config.battery_threshold;
@@ -3317,11 +5062,12 @@ ha-card.mini .pnote {
          doing it too is deliberate: it lives on a dashboard that is open all
          day, so it observes far more transitions than the Health page ever
          does, and the two agree because they compute the same set. */
-      if (mode !== 'configuration-compact') trackRecoveries(model, this._config, now);
+      if (!noRuntime) trackRecoveries(model, this._config, now);
       model._now = now;
       /* Whatever the shared scan has produced so far; null means it is still
          running and the configuration sections say so. */
       model.config = configCache.model;
+      model.conflicts = configCache.model && configCache.model.conflicts;
       this._model = model;
       this._render();
       /* The device tile never reads configuration, so it never triggers the
@@ -3347,6 +5093,7 @@ ha-card.mini .pnote {
           this._scanning = false;
           if (!this._model) return;
           this._model.config = m;
+          this._model.conflicts = m && m.conflicts;
           this._render();
         });
       if (force) run();
@@ -3385,11 +5132,13 @@ ha-card.mini .pnote {
         else if (name === 'summary') parts.push(summarySection(model, cfg));
         else if (name === 'config_summary') parts.push(configSummarySection(model));
         else if (name === 'config') parts.push(configSection(model, this._state));
+        else if (name === 'conflicts') parts.push(conflictsSection(model, this._state));
         else if (name === 'clusters') parts.push(clustersSection(model));
         else if (name === 'attention') parts.push(attentionSection(model, this._state, cfg));
         else if (name === 'battery') parts.push(this._state.chip === 'battery' ? '' : batterySection(model, cfg));
         else if (name === 'recovered') parts.push(recoveredSection(model, cfg));
         else if (name === 'deleted') parts.push(deletedSection(model, cfg));
+        else if (name === 'skipped') parts.push(skippedSection(model));
         else if (name === 'integrations') parts.push(integrationsSection(model));
         else if (name === 'orphans') parts.push(orphansSection(model, this._state));
       }
@@ -3435,16 +5184,37 @@ ha-card.mini .pnote {
      */
     _renderCompact(fromPeer) {
       const mode = this._config.mode;
+
+      /* The overall card stands alone: it already contains every group, so it
+         has no partner to keep a row even with. */
+      if (mode === 'overall-compact') {
+        const view = overallCompact(this._model);
+        this.hidden = !view && !this._inEditor();
+        const root = this._ensureRoot();
+        const wrap = root.querySelector('.wrap');
+        wrap.innerHTML = view ? overallHtml(view, this._config.navigation_path) : '';
+        if (view) {
+          const card = root.querySelector('ha-card');
+          if (card) {
+            card.title = view.word + ' — ' +
+              view.groups.map((g) => g.label + ': ' + g.items.join(', ')).join(' · ');
+          }
+        }
+        return;
+      }
+
       const problem = mode === 'device-compact'
         ? deviceCompact(this._model, this._config)
-        : configCompact(this._model.config);
+        : mode === 'conflicts-compact'
+          ? conflictsCompact(this._model.conflicts)
+          : configCompact(this._model.config);
 
       /* Published before the peers are consulted, so they read the current
          answer rather than the previous one. */
       const changed = this._compactHasProblem !== !!problem;
       this._compactHasProblem = !!problem;
 
-      const show = !!problem || peerHasProblem(this);
+      const show = visibleCompactModes().has(mode);
       this.hidden = !show && !this._inEditor();
 
       const view = problem || (show ? zeroCompact(mode, this._model) : null);
@@ -3462,9 +5232,9 @@ ha-card.mini .pnote {
         if (card) card.title = view.count + ' ' + view.label.toLowerCase() + ' — ' + view.detail;
       }
 
-      /* Only a change in this tile's own verdict can change a peer's decision,
-         and a peer re-rendering never changes its own verdict - so this
-         recurses exactly one level and cannot loop. */
+      /* One tile's verdict changing can change which tiles the whole group
+         shows, so the peers re-render. A peer re-render never changes its own
+         verdict, so this recurses exactly one level and cannot loop. */
       if (changed && !fromPeer) {
         for (const card of compactPeers) if (card !== this) card._renderCompact(true);
       }
@@ -3507,6 +5277,53 @@ ha-card.mini .pnote {
      * anchor would work too, but it would drop the whole frontend and reload
      * it, which on a wall tablet takes seconds.
      */
+    /**
+     * Adds or removes the skip label on a device.
+     *
+     * The label is created on first use rather than requiring the user to make
+     * one by hand, and the write goes through the device registry so every
+     * browser and tablet sees the same list. `hass.devices` is replaced by the
+     * registry subscription once the write lands, which is what re-renders the
+     * page - there is nothing to poll and no local copy to keep in step.
+     */
+    async _setSkipped(deviceId, on, button) {
+      const hass = this._hass;
+      if (!hass || !deviceId) return;
+      const label = this._config.skip_label;
+      if (button) button.classList.add('is-busy');
+      try {
+        if (on) {
+          /* Creating it every time would fail on the second device, so the
+             registry is consulted first. */
+          const labels = await hass.callWS({ type: 'config/label_registry/list' });
+          if (!labels.some((l) => l.label_id === label)) {
+            await hass.callWS({
+              type: 'config/label_registry/create',
+              name: SKIP_LABEL_NAME,
+              icon: 'mdi:eye-off-outline',
+              color: 'grey',
+            });
+          }
+        }
+        const device = (hass.devices || {})[deviceId] || {};
+        const current = device.labels || [];
+        const next = on
+          ? (current.indexOf(label) >= 0 ? current : current.concat(label))
+          : current.filter((l) => l !== label);
+        await hass.callWS({ type: 'config/device_registry/update', device_id: deviceId, labels: next });
+        /* The registry push is what normally redraws the page, but a card
+           whose config named the device statically would never see one. */
+        this._signature = null;
+        this._update();
+      } catch (e) {
+        if (button) {
+          button.classList.remove('is-busy');
+          button.classList.add('is-failed');
+          button.setAttribute('title', 'Could not update the device: ' + (e && e.message ? e.message : e));
+        }
+      }
+    }
+
     _navigate(path) {
       history.pushState(null, '', path);
       window.dispatchEvent(new CustomEvent('location-changed', { bubbles: true, composed: true }));
@@ -3522,6 +5339,18 @@ ha-card.mini .pnote {
       root.replaceChildren(style, wrap);
 
       wrap.addEventListener('click', (ev) => {
+        const skip = ev.target.closest('[data-skip]');
+        if (skip) {
+          ev.stopPropagation();
+          this._setSkipped(skip.dataset.skip, true, skip);
+          return;
+        }
+        const unskip = ev.target.closest('[data-unskip]');
+        if (unskip) {
+          ev.stopPropagation();
+          this._setSkipped(unskip.dataset.unskip, false, unskip);
+          return;
+        }
         const device = ev.target.closest('[data-device]');
         if (device) {
           ev.stopPropagation();
@@ -3565,6 +5394,12 @@ ha-card.mini .pnote {
           this._render();
           return;
         }
+        const conflChip = ev.target.closest('[data-confl]');
+        if (conflChip) {
+          this._state.conflictChip = conflChip.dataset.confl;
+          this._render();
+          return;
+        }
         const toggle = ev.target.closest('[data-toggle]');
         if (toggle) {
           const key = toggle.dataset.toggle;
@@ -3588,10 +5423,14 @@ ha-card.mini .pnote {
     analyse, trackRecoveries, findClusters, durationText, batteryIcon, ageOf,
     HEALTH_SIGNALS, SEVERITY,
     buildIndex, inspectConfiguration, walkRefs, judge, findingsOf,
+    analyseConflicts, conflictsCompact, overallCompact, sequenceDuration, durationSeconds, triggerOccurrences,
+    collectTargets, areOpposites, clockToMinutes, minutesToClock, DEFAULT_CONFLICTS,
     deviceCompact, configCompact,
     DEFAULTS: {
       ignored_domains: DEFAULT_IGNORED_DOMAINS,
       exclude_integrations: DEFAULT_EXCLUDED_INTEGRATIONS,
+      skip_label: DEFAULT_SKIP_LABEL,
+      exclude_devices: [],
       battery_threshold: DEFAULT_BATTERY_THRESHOLD,
       degraded_ratio: DEFAULT_DEGRADED_RATIO,
       recovery_minutes: DEFAULT_RECOVERY_MINUTES,
