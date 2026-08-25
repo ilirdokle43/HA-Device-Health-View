@@ -89,10 +89,20 @@ def _suggest(ref, ents):
     return best, round(score, 3)
 
 
+# A top-level item in automations.yaml / scenes.yaml ("- id: x") or in
+# scripts.yaml ("script_object_id:"). Tracking it while scanning attributes
+# a hit to the automation or script that holds it, not just to a line.
+HOLDER_LIST_RE = re.compile(r"^-\s*id:\s*['\"]?([^'\"\s]+)")
+HOLDER_MAP_RE = re.compile(r"^([a-z0-9_]+):\s*$")
+
+
 def scan_files(ents, svcs, doms):
     found = {}
     files = 0
     dynamic = 0
+    # Every reference that resolves. A thing named nowhere in here is used
+    # by nothing, which is what makes "safe to delete" answerable.
+    used = set()
     for path in _iter_files():
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -103,9 +113,16 @@ def scan_files(ents, svcs, doms):
         cat = _category(path)
         rel = os.path.relpath(path, CONFIG_DIR)
         is_yaml = path.endswith((".yaml", ".yml"))
+        base = os.path.basename(path)
+        track = base in ("automations.yaml", "scripts.yaml", "scenes.yaml")
+        holder = None
         for num, line in enumerate(text.split("\n"), 1):
             if is_yaml and line.lstrip().startswith("#"):
                 continue
+            if track:
+                m_h = HOLDER_LIST_RE.match(line) or HOLDER_MAP_RE.match(line)
+                if m_h:
+                    holder = m_h.group(1)
             for m in REF_RE.finditer(line):
                 ref = m.group(0)
                 nxt = line[m.end():m.end() + 1]
@@ -118,7 +135,10 @@ def scan_files(ents, svcs, doms):
                 # prose such as "switch.turned_on/turned_off" in a description
                 if nxt == "/":
                     continue
-                if m.group(1) not in doms or ref in ents or ref in svcs:
+                if ref in ents or ref in svcs:
+                    used.add(ref)
+                    continue
+                if m.group(1) not in doms:
                     continue
                 rec = found.setdefault(
                     ref,
@@ -126,8 +146,11 @@ def scan_files(ents, svcs, doms):
                      "malformed": nxt == "."},
                 )
                 if len(rec["occurrences"]) < 12:
-                    rec["occurrences"].append({"file": rel, "line": num})
-    return found, files, dynamic
+                    occ = {"file": rel, "line": num}
+                    if holder:
+                        occ["holder"] = holder
+                    rec["occurrences"].append(occ)
+    return found, files, dynamic, used
 
 
 def fix_files(targets, entity_id, replacement, stamp):
@@ -195,3 +218,29 @@ def dashboard_url_path(storage_file):
     if not rest or rest == "lovelace":
         return None
     return rest.replace("dashboard_", "dashboard-", 1) if rest.startswith("dashboard_") else rest
+
+
+ENTITY_REGISTRY = os.path.join(CONFIG_DIR, ".storage", "core.entity_registry")
+
+
+def entry_entities(entry_ids):
+    """{config_entry_id: [entity_id, ...]} for the given entries.
+
+    config_entry_id only exists in the entity registry, so the mapping cannot
+    be had from the state machine. Reading the file directly keeps this with
+    the rest of the blocking work.
+    """
+    want = set(entry_ids or ())
+    out = {e: [] for e in want}
+    if not want:
+        return out
+    try:
+        with open(ENTITY_REGISTRY, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return out
+    for ent in data.get("data", {}).get("entities", []):
+        cid = ent.get("config_entry_id")
+        if cid in want:
+            out[cid].append(ent.get("entity_id"))
+    return out

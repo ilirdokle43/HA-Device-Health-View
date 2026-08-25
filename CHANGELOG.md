@@ -4,6 +4,20 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.25.2
+
+- **Delete, next to Open, when the thing holding a broken reference is used by nothing.**
+  A helper or script that nothing references and that points at something gone is a dead
+  end, not a repair job — removing it is usually the honest answer.
+- The scan now records every reference that *resolves*, so "used by nothing" is established
+  rather than assumed. That matters because a template helper can be referenced from another
+  helper's options, which the frontend cannot see at all.
+- One button per unreferenced holder, named when a reference has more than one, and only for
+  the unreferenced ones — a row whose holders are all in use still shows Open alone.
+  Two-step confirm, and Home Assistant performs the removal through its own APIs.
+- Automations and scenes are never offered for deletion even when unreferenced: one nothing
+  calls may still be triggered by time or state.
+
 ## 2026.8.25.1
 
 - **Broken references now offer a way in rather than a dropdown.** A reference the card is

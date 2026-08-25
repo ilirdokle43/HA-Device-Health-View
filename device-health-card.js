@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.25.1
+ * @version 2026.8.25.2
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.25.1';
+  const CARD_VERSION = '2026.8.25.2';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -5688,8 +5688,23 @@ ha-card.mini.overall { overflow: hidden; }
         : (m.suggestion && m.confidence >= 0.9) ? "Fix"
         : dest ? dest.label
         : "Choose";
-      var action = '<span data-slot="1"><button data-idx="' + f.list.indexOf(m) +
-        '" style="' + BTN + 'color:var(--primary-color,#03a9f4)">' + label + "</button></span>";
+      /* A helper or script that nothing references, pointing at something that
+         no longer exists, is a dead end rather than a repair job. Offering to
+         remove it is usually the honest answer - but only when the scan has
+         actually established it is unreferenced. */
+      var idx = f.list.indexOf(m);
+      var dead = (m.holders || []).filter(function (h) { return h.unused; });
+      var dels = dead.map(function (h, hi) {
+        var name = h.title || h.entity_id || "";
+        var lbl = dead.length > 1
+          ? "Delete " + (name.length > 16 ? name.slice(0, 15) + "…" : name)
+          : "Delete";
+        return '<button data-del="' + idx + ":" + hi + '" title="' +
+          esc("Delete the " + h.kind + " “" + name + "”, which nothing references") +
+          '" style="' + BTN + 'margin-left:6px;color:var(--error-color,#db4437)">' + esc(lbl) + "</button>";
+      }).join("");
+      var action = '<span data-slot="1"><button data-idx="' + idx +
+        '" style="' + BTN + 'color:var(--primary-color,#03a9f4)">' + label + "</button>" + dels + "</span>";
       var hint = m.suggestion
         ? '<div style="opacity:.65;font-size:12px">&rarr; ' + esc(m.suggestion) +
           " (" + Math.round((m.confidence || 0) * 100) + "%)</div>"
@@ -5714,6 +5729,14 @@ ha-card.mini.overall { overflow: hidden; }
     Array.prototype.forEach.call(panel.querySelectorAll("button[data-idx]"), function (btn) {
       btn.onclick = function () {
         onFix(card, f.list[Number(btn.getAttribute("data-idx"))], btn);
+      };
+    });
+    Array.prototype.forEach.call(panel.querySelectorAll("button[data-del]"), function (btn) {
+      btn.onclick = function () {
+        var parts = btn.getAttribute("data-del").split(":");
+        var rec = f.list[Number(parts[0])];
+        var dead = (rec.holders || []).filter(function (h) { return h.unused; });
+        onDelete(card, dead[Number(parts[1])], btn);
       };
     });
   }
@@ -5785,6 +5808,37 @@ ha-card.mini.overall { overflow: hidden; }
         console.warn("[config-health]", e);
       }
     );
+  }
+
+  /**
+   * Removes a helper or script that nothing references.
+   *
+   * Deleting is irreversible, so it goes through the same two-step confirm the
+   * fix button uses, and Home Assistant performs the removal through its own
+   * APIs rather than anything here touching a file.
+   */
+  function onDelete(card, holder, btn) {
+    if (!holder) return;
+    arm(btn, function () {
+      busy(btn, "Deleting...");
+      var done;
+      if (holder.kind === "helper" && holder.entry_id) {
+        done = card._hass.callWS({ type: "config_entries/delete", entry_id: holder.entry_id });
+      } else if (holder.kind === "script" && holder.object_id) {
+        done = card._hass.callApi("DELETE", "config/script/config/" + holder.object_id);
+      } else {
+        done = Promise.reject(new Error("nothing identified to delete"));
+      }
+      done.then(function () {
+        btn.textContent = "Deleted";
+        return card._hass.callService("pyscript", "config_health_rescan", {});
+      }, function (e) {
+        btn.disabled = false;
+        btn.textContent = "Failed";
+        btn.title = String(e && e.message ? e.message : e);
+        console.warn("[config-health]", e);
+      });
+    });
   }
 
   function onFix(card, m, btn) {

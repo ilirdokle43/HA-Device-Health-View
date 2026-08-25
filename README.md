@@ -209,6 +209,16 @@ can correct it in Home Assistant's own editor:
 | A dashboard card | **Open dashboard** |
 | An automation, script or scene | **Open automation** / **script** / **scene**, straight to the editor |
 
+And when the helper or script holding the reference is itself **referenced by nothing**, a
+**Delete** button appears beside it. A dead end is usually better removed than repaired.
+
+"Used by nothing" is established, not assumed: the scan records every reference that
+resolves, across the YAML config, the dashboards and the helper options — the last of which
+the frontend cannot see, so a helper called only from another helper is still correctly
+counted as used. Deleting asks for confirmation and is carried out by Home Assistant's own
+APIs. Automations and scenes are never offered for deletion even when unreferenced, since
+one nothing calls may still be triggered by time or state.
+
 ## How runtime health is decided
 
 Health is evaluated per **device**, from that device's *runtime entities*: registry entities

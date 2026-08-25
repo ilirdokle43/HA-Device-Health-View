@@ -44,9 +44,65 @@ def _known():
     return ents, svcs, doms
 
 
-def _publish(found, files, dynamic, ents):
+def _mark_holders(rec, used, ents_by_entry):
+    """Say whether the thing holding this broken reference is itself used.
+
+    A helper or script that nothing references and that points at something
+    gone is a dead end, and safe to remove outright rather than repair. The
+    answer has to come from the scan: a template helper can be referenced from
+    another helper's options, which is not visible to the frontend at all.
+    """
+    holders = []
+
+    for own in rec.get("owners", []):
+        eid = own.get("entry_id")
+        if not eid:
+            continue
+        mine = ents_by_entry.get(eid, [])
+        holders.append({
+            "kind": "helper",
+            "entry_id": eid,
+            "title": own.get("title"),
+            "entities": mine,
+            # No entities at all is not evidence of disuse - it usually means
+            # the helper failed to set up - so only a real, unreferenced set
+            # counts as unused.
+            "unused": bool(mine) and not any([e in used for e in mine]),
+        })
+
+    for occ in rec.get("occurrences", []):
+        holder = occ.get("holder")
+        if not holder:
+            continue
+        base = occ["file"].rsplit("/", 1)[-1]
+        dom = {"scripts.yaml": "script", "automations.yaml": "automation",
+               "scenes.yaml": "scene"}.get(base)
+        if dom != "script":
+            # Only scripts are offered for deletion: an automation or scene
+            # nothing calls may still be triggered by time or state.
+            continue
+        ent = "script." + holder
+        if any([h.get("entity_id") == ent for h in holders]):
+            continue
+        holders.append({
+            "kind": "script", "entity_id": ent, "object_id": holder,
+            "title": ent, "unused": ent not in used,
+        })
+
+    rec["holders"] = holders
+
+
+def _publish(found, files, dynamic, ents, used):
     items = []
-    owners = ha_config_scan.entry_owners(sorted(found))
+    # Both of these read files, so they belong off the event loop and want
+    # doing once for the whole scan rather than once per record.
+    owners = task.executor(ha_config_scan.entry_owners, sorted(found))
+    entry_ids = []
+    for own_list in owners.values():
+        for o in own_list:
+            if o.get("entry_id") and o["entry_id"] not in entry_ids:
+                entry_ids.append(o["entry_id"])
+    ents_by_entry = task.executor(ha_config_scan.entry_entities, entry_ids) if entry_ids else {}
     for ref in sorted(found):
         rec = found[ref]
         rec["owners"] = owners.get(ref, [])
@@ -67,6 +123,7 @@ def _publish(found, files, dynamic, ents):
         rec["editable"] = not any(
             [o["file"].startswith(".storage") for o in rec["occurrences"]]
         )
+        _mark_holders(rec, used, ents_by_entry)
         items.append(rec)
     by_cat = {}
     for it in items:
@@ -93,10 +150,10 @@ def config_health_rescan():
     # Rescan the HA config for broken entity references.
     started = time.time()
     ents, svcs, doms = _known()
-    found, files, dynamic = task.executor(
+    found, files, dynamic, used = task.executor(
         ha_config_scan.scan_files, ents, svcs, doms
     )
-    items = _publish(found, files, dynamic, ents)
+    items = _publish(found, files, dynamic, ents, used)
     log.info(
         f"config_health: {len(items)} missing refs in {files} files "
         f"({time.time() - started:.1f}s)"
