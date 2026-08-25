@@ -200,7 +200,14 @@ through Home Assistant's own APIs instead — `lovelace/config/save` for a dashb
 options flow for a helper — so Home Assistant performs the write.
 
 A one-click **Fix** is only offered when a rename is near-certain. Anything less confident
-offers **Choose**, which asks you to pick the replacement.
+does not guess — it gives you a way in instead, opening whatever holds the reference so you
+can correct it in Home Assistant's own editor:
+
+| Where the reference lives | Button |
+|---|---|
+| A template helper built in the UI | **Open helper** — its more-info dialog, and the settings cog |
+| A dashboard card | **Open dashboard** |
+| An automation, script or scene | **Open automation** / **script** / **scene**, straight to the editor |
 
 ## How runtime health is decided
 

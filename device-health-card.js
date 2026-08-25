@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.25
+ * @version 2026.8.25.1
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.25';
+  const CARD_VERSION = '2026.8.25.1';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -5547,6 +5547,10 @@ ha-card.mini.overall { overflow: hidden; }
         iss.chLine = occ.line;
         iss.chSuggestion = rec.suggestion;
         iss.chEditable = rec.editable;
+        /* The card already worked out what this item is and how to open it.
+           Keeping the link means the panel never has to re-derive a route
+           from a file path and a line number. */
+        rec.chItem = item;
         matched[iss.ref] = true;
         hit = true;
         verified += 1;
@@ -5575,6 +5579,83 @@ ha-card.mini.overall { overflow: hidden; }
 
   var BTN = "cursor:pointer;border-radius:8px;border:1px solid var(--divider-color,#444);background:transparent;padding:4px 10px;";
 
+  /**
+   * Where the thing holding this broken reference can be edited.
+   *
+   * A reference the card cannot safely repair is not a dead end - it is a
+   * signpost. Every kind of holder has somewhere a person can go and fix it by
+   * hand, and that beats a dropdown of every sensor in the house.
+   *
+   * Returns {label, open(card)} or null when there is genuinely nowhere to go.
+   */
+  function destination(m) {
+    var item = m.chItem;
+
+    /* Automations, scripts and scenes have real editors, keyed on the id the
+       state machine carries rather than the file line the scan recorded. */
+    if (item && item.entityId) {
+      var dom = item.entityId.split(".")[0];
+      var editor = { automation: "automation", script: "script", scene: "scene" }[dom];
+      if (editor) {
+        return {
+          label: "Open " + editor,
+          open: function (card) {
+            var st = card._hass.states[item.entityId];
+            var id = st && st.attributes && st.attributes.id;
+            /* Scripts are edited by object_id; the other two by their numeric
+               id. Without one, the more-info dialog is still a way in. */
+            if (dom === "script") id = item.entityId.split(".")[1];
+            if (!id) return moreInfo(card, item.entityId);
+            go(card, "/config/" + editor + "/edit/" + id);
+          }
+        };
+      }
+    }
+
+    /* Dashboards: the card knows the url_path, and so does the scan. */
+    var occ = (m.occurrences && m.occurrences[0]) || {};
+    var urlPath = (item && item.urlPath) ||
+      (String(occ.file || "").indexOf(".storage/lovelace") === 0 ? (m.dashboard || "lovelace") : null);
+    if (urlPath) {
+      return {
+        label: "Open dashboard",
+        open: function (card) { go(card, "/" + urlPath); }
+      };
+    }
+
+    /* Helpers built in the UI. Home Assistant has no URL for a single config
+       entry - /config/helpers/edit/<id> renders the plain list - so the way in
+       is the helper's own entity, whose more-info dialog carries the settings
+       cog. The entity is found through the registry, which is the only place
+       config_entry_id is exposed. */
+    var own = (m.owners || [])[0];
+    if (own && own.entry_id) {
+      return {
+        label: "Open helper",
+        open: function (card) {
+          return card._hass.callWS({ type: "config/entity_registry/list" }).then(function (reg) {
+            var hit = reg.filter(function (e) { return e.config_entry_id === own.entry_id; })[0];
+            if (hit) return moreInfo(card, hit.entity_id);
+            go(card, "/config/helpers");
+          }).catch(function () { go(card, "/config/helpers"); });
+        }
+      };
+    }
+    return null;
+  }
+
+  function go(card, path) {
+    if (typeof card._navigate === "function") return card._navigate(path);
+    history.pushState(null, "", path);
+    window.dispatchEvent(new CustomEvent("location-changed", { bubbles: true, composed: true }));
+  }
+
+  function moreInfo(card, entityId) {
+    card.dispatchEvent(new CustomEvent("hass-more-info", {
+      detail: { entityId: entityId }, bubbles: true, composed: true
+    }));
+  }
+
   function paint(card) {
     var root = card.shadowRoot;
     if (!root) return;
@@ -5599,7 +5680,14 @@ ha-card.mini.overall { overflow: hidden; }
       var occ = (m.occurrences && m.occurrences[0]) || {};
       var where = occ.file ? esc(occ.file) + ":" + esc(occ.line) : "";
       var dup = m.malformed && m.entity_id.split(".")[0] === m.entity_id.split(".")[1];
-      var label = dup ? "Fix typo" : ((m.suggestion && m.confidence >= 0.9) ? "Fix" : "Choose");
+      /* A button that says Fix should fix. When the card is not confident
+         enough to rewrite anything, the honest offer is to open whatever holds
+         the reference so it can be corrected in Home Assistant's own editor. */
+      var dest = (dup || (m.suggestion && m.confidence >= 0.9)) ? null : destination(m);
+      var label = dup ? "Fix typo"
+        : (m.suggestion && m.confidence >= 0.9) ? "Fix"
+        : dest ? dest.label
+        : "Choose";
       var action = '<span data-slot="1"><button data-idx="' + f.list.indexOf(m) +
         '" style="' + BTN + 'color:var(--primary-color,#03a9f4)">' + label + "</button></span>";
       var hint = m.suggestion
@@ -5706,6 +5794,10 @@ ha-card.mini.overall { overflow: hidden; }
       arm(btn, function () { run(card, m, dup ? null : m.suggestion, dup, btn); });
       return;
     }
+    /* Not confident enough to rewrite: take the reader to the holder instead.
+       The picker below stays only for the case with nowhere to go. */
+    var dest = destination(m);
+    if (dest) { dest.open(card); return; }
     var slot = btn.parentNode;
     var dom = m.entity_id.split(".")[0];
     var sel = document.createElement("select");

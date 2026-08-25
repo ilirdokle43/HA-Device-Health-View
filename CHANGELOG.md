@@ -4,6 +4,21 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.25.1
+
+- **Broken references now offer a way in rather than a dropdown.** A reference the card is
+  confident about still shows **Fix**. Everything else now opens whatever holds the
+  reference, so it can be corrected in Home Assistant's own editor:
+  **Open helper** for a UI-built template helper, **Open dashboard** for a card,
+  **Open automation / script / scene** for an editor-backed item.
+- Previously every unconfident row said *Choose*, which offered a `<select>` of every entity
+  in the domain — hundreds of sensors — and then rewrote the configuration. That picker
+  remains only as a last resort, for a finding with nowhere to go.
+- Home Assistant has no URL for a single config entry (`/config/helpers/edit/<id>` just
+  renders the list), so a helper is reached through its own entity's more-info dialog, which
+  carries the settings cog. The entity is resolved from the registry, the only place
+  `config_entry_id` is exposed.
+
 ## 2026.8.25
 
 ### Broken references (new, optional)
