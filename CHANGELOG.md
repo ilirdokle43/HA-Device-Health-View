@@ -4,6 +4,22 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.25.4
+
+### Fixed
+
+- **The page now follows the scan.** Deleting or fixing a reference asked for a rescan, the
+  rescan republished — and nothing redrew, so the reference stayed on screen looking
+  untouched. The card decides whether to re-render from a signature over the states that can
+  change what it draws, and the scan entity is not one of them.
+  The panel and the CONFIGURATION HEALTH counters now follow that entity whoever asked for
+  the scan: this card, another tab, or the nightly one.
+- **Rescan redraws.** The panel's own Rescan button asked for a scan and then left the old
+  results on screen.
+- A delete waits for Home Assistant to flush `.storage` before rescanning. The scanner reads
+  those files rather than the running registry, so scanning the instant a delete returns
+  could read the pre-delete file and leave the row up — indistinguishable from a failure.
+
 ## 2026.8.25.3
 
 ### Fixed

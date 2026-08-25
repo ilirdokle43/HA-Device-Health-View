@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.25.3
+ * @version 2026.8.25.4
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.25.3';
+  const CARD_VERSION = '2026.8.25.4';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -5724,7 +5724,7 @@ ha-card.mini.overall { overflow: hidden; }
       (rows.length ? rows.join("") : '<div style="padding:8px 0;opacity:.6">No broken references.</div>');
     var rescan = root.getElementById("ch-rescan");
     if (rescan) rescan.onclick = function () {
-      card._hass.callService("pyscript", "config_health_rescan", {});
+      rescanAndRedraw(card, rescan);
     };
     Array.prototype.forEach.call(panel.querySelectorAll("button[data-idx]"), function (btn) {
       btn.onclick = function () {
@@ -5775,6 +5775,41 @@ ha-card.mini.overall { overflow: hidden; }
       patched.__chPatched = true;
       proto._render = patched;
     }
+
+    /* Follow the scan entity.
+     *
+     * The card decides whether to re-render from a signature over the states
+     * that can change what it draws, and pyscript.config_health is not one of
+     * them - it is neither unavailable, unknown, a battery nor a connectivity
+     * sensor. So a finished rescan republished without anything redrawing, and
+     * a reference that had just been deleted sat on screen looking undeleted.
+     *
+     * Hooking the hass setter catches it whoever asked for the scan: this
+     * card, another tab, or the nightly one. Cheaper than a subscription, and
+     * it is one string compare per state change. */
+    var desc = Object.getOwnPropertyDescriptor(proto, "hass");
+    if (desc && typeof desc.set === "function" && !desc.set.__chPatched) {
+      var origSet = desc.set;
+      var patchedSet = function (hass) {
+        var prev = this.__chGeneration;
+        origSet.call(this, hass);
+        var st = hass && hass.states && hass.states[ENTITY];
+        var gen = (st && st.attributes && st.attributes.generated) || null;
+        if (gen === prev) return;
+        this.__chGeneration = gen;
+        /* Not on the first sighting: the card is about to render anyway, and
+           rendering before it has a model throws. */
+        if (prev === undefined || !this._model) return;
+        try { this._render(); } catch (e) { console.warn("[config-health]", e); }
+      };
+      patchedSet.__chPatched = true;
+      Object.defineProperty(proto, "hass", {
+        get: desc.get,
+        set: patchedSet,
+        enumerable: desc.enumerable,
+        configurable: true,
+      });
+    }
     return true;
   }
 
@@ -5800,7 +5835,9 @@ ha-card.mini.overall { overflow: hidden; }
   function run(card, m, replacement, dedup, btn) {
     busy(btn, "Fixing...");
     applyFix(card, m, replacement, dedup).then(
-      function () { btn.textContent = "Done"; },
+      function () {
+        btn.textContent = "Done";
+      },
       function (e) {
         btn.disabled = false;
         btn.textContent = "Failed";
@@ -5817,6 +5854,29 @@ ha-card.mini.overall { overflow: hidden; }
    * fix button uses, and Home Assistant performs the removal through its own
    * APIs rather than anything here touching a file.
    */
+  function generatedAt(card) {
+    var st = card._hass && card._hass.states && card._hass.states[ENTITY];
+    return (st && st.attributes && st.attributes.generated) || null;
+  }
+
+  /**
+   * Asks for a rescan and redraws once it lands.
+   *
+   * Neither half happens on its own. The scan walks the whole configuration,
+   * so it finishes seconds after the service call returns; and the entity it
+   * republishes to is not part of the card's render signature, so the new
+   * state alone would never repaint anything. Without this, a deleted
+   * reference sits on screen looking undeleted.
+   *
+   * The redraw is a full `_render` rather than just the panel, because the
+   * CONFIGURATION HEALTH counters are filled in by merge() on render and would
+   * otherwise keep counting what is gone.
+   */
+  function rescanAndRedraw(card, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = "Rescanning…"; }
+    return card._hass.callService("pyscript", "config_health_rescan", {});
+  }
+
   function onDelete(card, holder, btn) {
     if (!holder) return;
     arm(btn, function () {
@@ -5834,7 +5894,14 @@ ha-card.mini.overall { overflow: hidden; }
       }
       done.then(function () {
         btn.textContent = "Deleted";
-        return card._hass.callService("pyscript", "config_health_rescan", {});
+        /* Home Assistant writes .storage on a delay, and the scanner reads
+           those files rather than the running registry. Rescanning the
+           instant the delete returns can therefore read the pre-delete file
+           and leave the row on screen, which looks exactly like the delete
+           having failed. A short wait costs nothing and removes the race. */
+        if (btn) { btn.disabled = true; btn.textContent = "Rescanning…"; }
+        return new Promise(function (resolve) { setTimeout(resolve, 10000); })
+          .then(function () { return rescanAndRedraw(card, btn); });
       }, function (e) {
         btn.disabled = false;
         btn.textContent = "Failed";
