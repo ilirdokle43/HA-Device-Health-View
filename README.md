@@ -20,8 +20,13 @@ other's findings.
 
 Everything comes from Home Assistant's own APIs — the state machine, the entity/device/area
 registries, `automation/config`, `script/config`, the scene editor endpoint, `lovelace/config`,
-`lovelace/resources` and `get_services`. No third-party integration is installed, queried or
-required for any of it, and nothing is ever written: the inspector diagnoses and never repairs.
+`lovelace/resources` and `get_services`. No third-party integration is required for any of it,
+and the card never writes to your configuration on its own.
+
+One optional extra goes further: a [pyscript backend](#broken-references-optional-backend) that
+finds dead references inside UI-created helpers, which the API does not expose. That part *can*
+repair a reference, but only when you press the button, and it never rewrites a `.storage` file
+Home Assistant owns.
 
 ## Features
 
@@ -73,7 +78,7 @@ That is the whole configuration. Everything below is optional.
 
 | Option | Default | What it does |
 |---|---|---|
-| `mode` | `full` | `full`, `device-compact` or `configuration-compact` |
+| `mode` | `full` | `full`, `device-compact`, `configuration-compact`, `conflicts-compact` or `overall-compact` |
 | `battery_threshold` | `18` | Percent at or under which a battery needs attention |
 | `degraded_ratio` | `0.5` | Fraction of a device's entities that must be unavailable before it is "degraded" rather than "offline" |
 | `recovery_minutes` | `120` | How long a recovered or deleted device stays listed |
@@ -152,6 +157,50 @@ trapped inside this card. The label is created the first time it is needed.
 That also gives you two other ways in, for a device that is currently healthy and so has no
 card to press Skip on: add the label by hand in Settings, or name the device in
 `exclude_devices`.
+
+## Broken references (optional backend)
+
+The inspector above reads what Home Assistant will serve over its API. That leaves one
+blind spot: **template helpers created in the UI**, whose configuration lives inside
+`.storage/core.config_entries` and is not exposed to the frontend. A helper averaging a
+sensor you deleted last year looks perfectly healthy from the outside and quietly returns
+`unknown`.
+
+An optional pyscript backend closes that gap. It walks the configuration files and the
+relevant `.storage` entries, publishes what it finds on `pyscript.config_health`, and the
+card grows a **BROKEN REFERENCES** panel listing each dead reference with the helper that
+owns it.
+
+### Installing it
+
+Requires the [pyscript](https://github.com/custom-components/pyscript) integration.
+
+1. Copy `pyscript/config_health.py` into `config/pyscript/`
+2. Copy `python_modules/ha_config_scan.py` into `config/python_modules/`
+3. Reload pyscript
+
+Without it the card behaves exactly as before — the panel simply does not appear. Nothing
+errors, and no counter changes.
+
+### Services
+
+| Service | What it does |
+|---|---|
+| `pyscript.config_health_rescan` | Re-runs the scan and republishes the entity. Also runs at startup and daily at 04:17. |
+| `pyscript.config_health_fix` | Replaces one missing reference with an existing entity. |
+
+### What it will and will not rewrite
+
+`config_health_fix` **refuses to touch anything under `.storage`** — Home Assistant owns
+those files at runtime and would overwrite the edit. For plain config files it copies the
+file to `<name>.bak-<timestamp>` before writing, then reloads the affected domain.
+
+Dashboard and helper references, which do live in `.storage`, are changed from the card
+through Home Assistant's own APIs instead — `lovelace/config/save` for a dashboard, the
+options flow for a helper — so Home Assistant performs the write.
+
+A one-click **Fix** is only offered when a rename is near-certain. Anything less confident
+offers **Choose**, which asks you to pick the replacement.
 
 ## How runtime health is decided
 

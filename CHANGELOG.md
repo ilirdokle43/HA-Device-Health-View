@@ -4,6 +4,36 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.25
+
+### Broken references (new, optional)
+
+- A **pyscript backend** (`pyscript/config_health.py` + `python_modules/ha_config_scan.py`)
+  that finds dead entity references inside **UI-created template helpers** — configuration
+  that lives in `.storage/core.config_entries` and is not exposed to the frontend, so the
+  card's own inspector could never see it. A helper averaging a sensor you deleted last year
+  looks healthy from the outside and quietly returns `unknown`.
+- The card grows a **BROKEN REFERENCES** panel listing each dead reference with the helper
+  that owns it, a Rescan button, and a per-row fix.
+- Fixing refuses to rewrite anything under `.storage` (Home Assistant owns those at runtime);
+  plain config files are backed up to `.bak-<timestamp>` first, and dashboard and helper
+  references go through Home Assistant's own APIs instead.
+- Entirely optional. Without the backend installed the panel does not appear, nothing errors
+  and no counter changes.
+
+### Fixed
+
+- The broken-references panel no longer appears on the compact tiles. It is patched onto the
+  shared prototype, so without a mode check every instance rendered it — including a tile
+  meant to be one line tall. The tile keeps the count and links through.
+
+### Also
+
+- Command surfaces (`remote`, `infrared`, `radio_frequency`, `siren`) now count as a fault
+  when `unavailable`, via `unavailable_is_fault_domains`. Their *idle* state looks bad, which
+  is why they are otherwise ignored — but a device whose only entities are command surfaces
+  was invisible to the page and could sit dead for hours behind a clean bill of health.
+
 ## 2026.8.22.1
 
 - **The default battery threshold is now 18%**, down from 20%. Devices that live on a charger

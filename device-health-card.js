@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.22.1
+ * @version 2026.8.25
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.22.1';
+  const CARD_VERSION = '2026.8.25';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -91,6 +91,29 @@
     'wake_word', 'ai_task', 'todo', 'update', 'person', 'device_tracker',
     'siren', 'remote', 'infrared', 'radio_frequency', 'media_player',
   ];
+
+  /**
+   * Ignored domains where `unavailable` is still a fault.
+   *
+   * The domains above are ignored because their IDLE state looks bad: a command
+   * surface reads `unknown` when it has never been fired. But those same
+   * entities do not go `unavailable` unless the hardware has actually left the
+   * network, and that IS news.
+   *
+   * Without this, a device whose ONLY entities are command surfaces is
+   * structurally invisible to this card. Every Broadlink IR blaster is exactly
+   * that shape - `remote` + `infrared` + `radio_frequency`, nothing else - so an
+   * RM4 pro can sit dead for hours while the page reports a clean bill of
+   * health. That is not hypothetical: it is how this list came to exist.
+   *
+   * `media_player` is deliberately NOT here. A TV that has been switched off is
+   * `unavailable` by design, which is the false positive the ignore list was
+   * written to prevent in the first place. Same for `update`, whose placeholder
+   * entities sit at `unavailable` permanently.
+   *
+   * Set `unavailable_is_fault_domains: []` to restore the old behaviour.
+   */
+  const DEFAULT_UNAVAILABLE_IS_FAULT = ['remote', 'infrared', 'radio_frequency', 'siren'];
 
   /**
    * Integrations whose devices are intermittent by design, so "not currently
@@ -338,6 +361,7 @@
     const manifests = cfg.manifests || {};
 
     const ignoredDomains = new Set(cfg.ignored_domains);
+    const faultWhenGone = new Set(cfg.unavailable_is_fault_domains);
     const excludedIntegrations = new Set(cfg.exclude_integrations);
     const excludes = toRegex(cfg.exclude);
     /* Devices the user has told the card to leave alone, by label or by a
@@ -398,7 +422,7 @@
       }
 
       if (!byDevice.has(deviceId)) {
-        byDevice.set(deviceId, { runtime: [], bad: [], unsure: [], conn: [], explicit: [], platforms: new Set() });
+        byDevice.set(deviceId, { runtime: [], bad: [], unsure: [], conn: [], explicit: [], cmd: [], platforms: new Set() });
       }
       const bucket = byDevice.get(deviceId);
       bucket.platforms.add(platform);
@@ -414,7 +438,15 @@
         deviceClass: attrs.device_class || null,
       };
       if (isConn) bucket.conn.push(row);
-      if (ignoredDomains.has(domain)) continue;
+      if (ignoredDomains.has(domain)) {
+        /* Held aside, not counted yet. Pass 2 promotes these only when they are
+           ALL unavailable and the device has nothing else to speak for it - see
+           DEFAULT_UNAVAILABLE_IS_FAULT. Admitting only the unavailable ones here
+           would make bad/runtime always 1.0 and call a half-registered device
+           "offline" when a live sibling entity proves it is reachable. */
+        if (faultWhenGone.has(domain)) bucket.cmd.push(row);
+        continue;
+      }
 
       bucket.runtime.push(row);
       if (isBad) bucket.bad.push(row);
@@ -430,6 +462,19 @@
     for (const [deviceId, bucket] of byDevice) {
       const device = devices[deviceId];
       if (!device || device.disabled_by) continue;
+      /* A device whose only entities are command surfaces is invisible to the
+         rules above, because those domains are ignored. That is the right call
+         while it is merely idle, but not when the hardware has left: a Broadlink
+         blaster is `remote` + `infrared` + `radio_frequency` and nothing else, so
+         it could sit dead for hours behind a clean bill of health.
+         Promote them only when EVERY one is unavailable. If any is still live the
+         device is reachable and the dead siblings are a duplicate registration,
+         which is a configuration matter rather than a health one. */
+      if (!bucket.runtime.length && bucket.cmd.length &&
+          bucket.cmd.every((r) => r.state === UNAVAILABLE)) {
+        for (const row of bucket.cmd) { bucket.runtime.push(row); bucket.bad.push(row); }
+      }
+
       /* A device with no runtime entities is a registry placeholder - an
          add-on, a frontend repository, a service shim - not a thing that can
          be online or offline. */
@@ -4870,6 +4915,8 @@ ha-card.mini.overall { overflow: hidden; }
         degraded_ratio: c.degraded_ratio === undefined ? DEFAULT_DEGRADED_RATIO : Number(c.degraded_ratio),
         recovery_minutes: c.recovery_minutes === undefined ? DEFAULT_RECOVERY_MINUTES : Number(c.recovery_minutes),
         ignored_domains: c.ignored_domains || DEFAULT_IGNORED_DOMAINS,
+        unavailable_is_fault_domains: c.unavailable_is_fault_domains === undefined
+          ? DEFAULT_UNAVAILABLE_IS_FAULT : c.unavailable_is_fault_domains,
         exclude_integrations: c.exclude_integrations || DEFAULT_EXCLUDED_INTEGRATIONS,
         skip_label: c.skip_label || DEFAULT_SKIP_LABEL,
         exclude_devices: c.exclude_devices || [],
@@ -5428,6 +5475,7 @@ ha-card.mini.overall { overflow: hidden; }
     deviceCompact, configCompact,
     DEFAULTS: {
       ignored_domains: DEFAULT_IGNORED_DOMAINS,
+      unavailable_is_fault_domains: DEFAULT_UNAVAILABLE_IS_FAULT,
       exclude_integrations: DEFAULT_EXCLUDED_INTEGRATIONS,
       skip_label: DEFAULT_SKIP_LABEL,
       exclude_devices: [],
@@ -5452,4 +5500,309 @@ ha-card.mini.overall { overflow: hidden; }
     'color: #fff; background: #03a9f4; font-weight: 700;',
     'color: #03a9f4; background: #fff; font-weight: 700;'
   );
+})();
+
+/* ---- CONFIG_HEALTH_PATCH v2 -------------------------------------------
+ * Verifies the card's "unvalidated" config issues against the server-side
+ * scan published on pyscript.config_health, fills the CONFIGURATION HEALTH
+ * counters, and adds a BROKEN REFERENCES panel with a Fix action.
+ * Additive only - delete this block to revert.
+ * -------------------------------------------------------------------- */
+(function () {
+  "use strict";
+  var ENTITY = "pyscript.config_health";
+  var TYPE_KEY = {
+    automation: "brokenAutomations",
+    script: "brokenScripts",
+    scene: "brokenScenes",
+    dashboard: "dashboardProblems"
+  };
+
+  function findings(hass) {
+    var st = hass && hass.states && hass.states[ENTITY];
+    var list = (st && st.attributes && st.attributes.missing) || [];
+    var byRef = {};
+    list.forEach(function (m) { byRef[m.entity_id] = m; });
+    return { st: st, list: list, byRef: byRef };
+  }
+
+  function merge(card) {
+    var cfg = card._model && card._model.config;
+    if (!cfg || !cfg.counts) return;
+    var f = findings(card._hass);
+    if (!f.st) return;
+    var counts = cfg.counts;
+    Object.keys(TYPE_KEY).forEach(function (t) { counts[TYPE_KEY[t]] = 0; });
+    counts.other = 0;
+    var verified = 0;
+    var matched = {};
+    (cfg.items || []).forEach(function (item) {
+      var hit = false;
+      (item.issues || []).forEach(function (iss) {
+        var rec = f.byRef[iss.ref];
+        if (!rec) return;
+        var occ = (rec.occurrences && rec.occurrences[0]) || {};
+        iss.confidence = "verified";
+        iss.chFile = occ.file;
+        iss.chLine = occ.line;
+        iss.chSuggestion = rec.suggestion;
+        iss.chEditable = rec.editable;
+        matched[iss.ref] = true;
+        hit = true;
+        verified += 1;
+      });
+      if (hit) {
+        item.band = "broken";
+        var key = TYPE_KEY[item.type];
+        if (key) counts[key] += 1;
+      }
+    });
+    counts.other = f.list.filter(function (m) { return !matched[m.entity_id]; }).length;
+    counts.verifiedIssues = verified;
+    counts.missingEntities = f.list.length;
+    counts.brokenTotal = counts.brokenAutomations + counts.brokenScripts +
+      counts.brokenScenes + counts.dashboardProblems + counts.other;
+    counts.brokenItems = counts.brokenTotal;
+    counts.unvalidated = Math.max(0, (counts.unvalidated || 0) - verified);
+    cfg.healthy = counts.brokenTotal === 0;
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  var BTN = "cursor:pointer;border-radius:8px;border:1px solid var(--divider-color,#444);background:transparent;padding:4px 10px;";
+
+  function paint(card) {
+    var root = card.shadowRoot;
+    if (!root) return;
+    var f = findings(card._hass);
+    var panel = root.getElementById("ch-panel");
+    /* The patch wraps _render on the prototype, so every instance runs it -
+       including the one-line alert tiles on a main dashboard. Only the full
+       page has room for the detail; a compact tile keeps the count, which
+       merge() still supplies, and links through. */
+    var mode = (card._config && card._config.mode) || "full";
+    if (mode !== "full") { if (panel) panel.remove(); return; }
+    if (!f.st) { if (panel) panel.remove(); return; }
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "ch-panel";
+      panel.style.cssText = "margin:12px 0 0;padding:12px 14px;border-radius:12px;" +
+        "background:var(--ha-card-background,var(--card-background-color,#1c1c1e));" +
+        "border:1px solid var(--divider-color,#333);font-size:14px";
+      root.appendChild(panel);
+    }
+    var rows = f.list.map(function (m) {
+      var occ = (m.occurrences && m.occurrences[0]) || {};
+      var where = occ.file ? esc(occ.file) + ":" + esc(occ.line) : "";
+      var dup = m.malformed && m.entity_id.split(".")[0] === m.entity_id.split(".")[1];
+      var label = dup ? "Fix typo" : ((m.suggestion && m.confidence >= 0.9) ? "Fix" : "Choose");
+      var action = '<span data-slot="1"><button data-idx="' + f.list.indexOf(m) +
+        '" style="' + BTN + 'color:var(--primary-color,#03a9f4)">' + label + "</button></span>";
+      var hint = m.suggestion
+        ? '<div style="opacity:.65;font-size:12px">&rarr; ' + esc(m.suggestion) +
+          " (" + Math.round((m.confidence || 0) * 100) + "%)</div>"
+        : "";
+      return '<div style="display:flex;gap:10px;align-items:center;padding:6px 0;' +
+        'border-top:1px solid var(--divider-color,#2a2a2a)">' +
+        '<div style="flex:1;min-width:0"><div style="overflow-wrap:anywhere">' +
+        esc(m.entity_id) + '</div><div style="opacity:.55;font-size:12px;overflow-wrap:anywhere">' +
+        where + "</div>" + hint + "</div>" + action + "</div>";
+    });
+    panel.innerHTML = '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+      '<span style="letter-spacing:.08em;opacity:.7">BROKEN REFERENCES</span>' +
+      '<span style="opacity:.5;font-size:12px">' + f.list.length + " found &middot; " +
+      esc(f.st.attributes.dynamic_refs || 0) + " dynamic skipped</span>" +
+      '<span style="flex:1"></span>' +
+      '<button id="ch-rescan" style="' + BTN + 'color:inherit">Rescan</button></div>' +
+      (rows.length ? rows.join("") : '<div style="padding:8px 0;opacity:.6">No broken references.</div>');
+    var rescan = root.getElementById("ch-rescan");
+    if (rescan) rescan.onclick = function () {
+      card._hass.callService("pyscript", "config_health_rescan", {});
+    };
+    Array.prototype.forEach.call(panel.querySelectorAll("button[data-idx]"), function (btn) {
+      btn.onclick = function () {
+        onFix(card, f.list[Number(btn.getAttribute("data-idx"))], btn);
+      };
+    });
+  }
+
+  function wrap(proto, name, after) {
+    var orig = proto[name];
+    if (typeof orig !== "function" || orig.__chPatched) return;
+    function patched() {
+      var out = orig.apply(this, arguments);
+      var self = this;
+      function run() {
+        try { after(self); } catch (e) { console.warn("[config-health]", e); }
+      }
+      if (out && typeof out.then === "function") {
+        return out.then(function (v) { run(); return v; });
+      }
+      run();
+      return out;
+    }
+    patched.__chPatched = true;
+    proto[name] = patched;
+  }
+
+  function install() {
+    var Ctor = customElements.get("device-health-card");
+    if (!Ctor) return false;
+    var proto = Ctor.prototype;
+    var orig = proto._render;
+    if (typeof orig === "function" && !orig.__chPatched) {
+      var patched = function () {
+        try { merge(this); } catch (e) { console.warn("[config-health]", e); }
+        var out = orig.apply(this, arguments);
+        try { paint(this); } catch (e) { console.warn("[config-health]", e); }
+        return out;
+      };
+      patched.__chPatched = true;
+      proto._render = patched;
+    }
+    return true;
+  }
+
+
+  function busy(btn, text) { btn.disabled = true; btn.textContent = text; }
+
+  function arm(btn, go) {
+    if (btn.getAttribute("data-armed") !== "1") {
+      var was = btn.textContent;
+      btn.setAttribute("data-armed", "1");
+      btn.textContent = "Confirm?";
+      setTimeout(function () {
+        if (btn.isConnected && btn.getAttribute("data-armed") === "1") {
+          btn.setAttribute("data-armed", "0");
+          btn.textContent = was;
+        }
+      }, 4000);
+      return;
+    }
+    go();
+  }
+
+  function run(card, m, replacement, dedup, btn) {
+    busy(btn, "Fixing...");
+    applyFix(card, m, replacement, dedup).then(
+      function () { btn.textContent = "Done"; },
+      function (e) {
+        btn.disabled = false;
+        btn.textContent = "Failed";
+        btn.title = String(e && e.message ? e.message : e);
+        console.warn("[config-health]", e);
+      }
+    );
+  }
+
+  function onFix(card, m, btn) {
+    if (!m) return;
+    var dup = m.malformed && m.entity_id.split(".")[0] === m.entity_id.split(".")[1];
+    if (dup || (m.suggestion && m.confidence >= 0.9)) {
+      arm(btn, function () { run(card, m, dup ? null : m.suggestion, dup, btn); });
+      return;
+    }
+    var slot = btn.parentNode;
+    var dom = m.entity_id.split(".")[0];
+    var sel = document.createElement("select");
+    sel.style.cssText = "max-width:180px;border-radius:8px;padding:3px;margin-right:6px";
+    var blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "pick replacement...";
+    sel.appendChild(blank);
+    Object.keys(card._hass.states).filter(function (id) {
+      return id.indexOf(dom + ".") === 0;
+    }).sort().forEach(function (id) {
+      var o = document.createElement("option");
+      o.value = id;
+      o.textContent = id;
+      if (id === m.suggestion) o.selected = true;
+      sel.appendChild(o);
+    });
+    var go = document.createElement("button");
+    go.textContent = "Apply";
+    go.setAttribute("style", btn.getAttribute("style"));
+    go.onclick = function () {
+      if (!sel.value) return;
+      run(card, m, sel.value, false, go);
+    };
+    slot.innerHTML = "";
+    slot.appendChild(sel);
+    slot.appendChild(go);
+  }
+
+  function swap(text, m, replacement, dedup) {
+    if (dedup) {
+      var dom = m.entity_id.split(".")[0];
+      return text.split(dom + "." + dom + ".").join(dom + ".");
+    }
+    var esc2 = m.entity_id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return text.replace(new RegExp(esc2 + "(?![A-Za-z0-9_])", "g"), replacement);
+  }
+
+  function fixDashboard(card, m, replacement, dedup) {
+    var url = m.dashboard || null;
+    return card._hass.callWS({ type: "lovelace/config", url_path: url }).then(function (cfg) {
+      var before = JSON.stringify(cfg);
+      var after = swap(before, m, replacement, dedup);
+      if (after === before) throw new Error("no match in dashboard " + (url || "default"));
+      return card._hass.callWS({ type: "lovelace/config/save", url_path: url, config: JSON.parse(after) });
+    }).then(function () {
+      return card._hass.callService("pyscript", "config_health_rescan", {});
+    });
+  }
+
+  var OPT = "config/config_entries/options/flow";
+
+  function applyFix(card, m, replacement, dedup) {
+    var file = (m.occurrences && m.occurrences[0] && m.occurrences[0].file) || "";
+    if (file.indexOf(".storage/lovelace") === 0) return fixDashboard(card, m, replacement, dedup);
+    if (file === ".storage/core.config_entries") return fixHelper(card, m, replacement);
+    return card._hass.callService("pyscript", "config_health_fix",
+      { entity_id: m.entity_id, replacement: replacement });
+  }
+
+  function rebuild(fields, m, replacement, missing) {
+    var data = {};
+    (fields || []).forEach(function (fld) {
+      var cur = fld.description && fld.description.suggested_value;
+      if (fld.type === "expandable") {
+        var sub = rebuild(fld.schema, m, replacement, missing);
+        if (Object.keys(sub).length) data[fld.name] = sub;
+        return;
+      }
+      if (cur !== undefined) {
+        data[fld.name] = typeof cur === "string" ? swap(cur, m, replacement, false) : cur;
+      } else if (fld.required) {
+        missing.push(fld.name);
+      }
+    });
+    return data;
+  }
+
+  function fixHelper(card, m, replacement) {
+    var own = (m.owners || [])[0];
+    if (!own) return Promise.reject(new Error("no owning helper recorded"));
+    var hass = card._hass;
+    return hass.callApi("POST", OPT, { handler: own.entry_id }).then(function (step) {
+      var missing = [];
+      var data = rebuild(step.data_schema, m, replacement, missing);
+      if (missing.length) {
+        return hass.callApi("DELETE", OPT + "/" + step.flow_id).then(function () {
+          throw new Error("form not reproducible; missing " + missing.join(","));
+        });
+      }
+      return hass.callApi("POST", OPT + "/" + step.flow_id, data);
+    }).then(function () {
+      return card._hass.callService("pyscript", "config_health_rescan", {});
+    });
+  }
+
+  if (!install()) {
+    customElements.whenDefined("device-health-card").then(install);
+  }
 })();
