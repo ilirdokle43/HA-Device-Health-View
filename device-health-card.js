@@ -50,14 +50,14 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.25.2
+ * @version 2026.8.25.3
  * @license MIT
  */
 
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.25.2';
+  const CARD_VERSION = '2026.8.25.3';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -5823,7 +5823,10 @@ ha-card.mini.overall { overflow: hidden; }
       busy(btn, "Deleting...");
       var done;
       if (holder.kind === "helper" && holder.entry_id) {
-        done = card._hass.callWS({ type: "config_entries/delete", entry_id: holder.entry_id });
+        /* Deleting a config entry is REST, not websocket - there is no
+           `config_entries/delete` command, and asking for one fails with
+           `unknown_command`. */
+        done = card._hass.callApi("DELETE", "config/config_entries/entry/" + holder.entry_id);
       } else if (holder.kind === "script" && holder.object_id) {
         done = card._hass.callApi("DELETE", "config/script/config/" + holder.object_id);
       } else {
@@ -5835,7 +5838,18 @@ ha-card.mini.overall { overflow: hidden; }
       }, function (e) {
         btn.disabled = false;
         btn.textContent = "Failed";
-        btn.title = String(e && e.message ? e.message : e);
+        var why = String((e && (e.message || e.body || e.error)) || e);
+        btn.title = why;
+        /* A tooltip is not a report. Say what went wrong where it can be
+           read, or the next person has to come and ask. */
+        var row = btn.parentNode && btn.parentNode.parentNode;
+        var text = row && row.querySelector("div");
+        if (text) {
+          var note = document.createElement("div");
+          note.style.cssText = "color:var(--error-color,#db4437);font-size:12px;margin-top:2px";
+          note.textContent = "Delete failed: " + why;
+          text.appendChild(note);
+        }
         console.warn("[config-health]", e);
       });
     });

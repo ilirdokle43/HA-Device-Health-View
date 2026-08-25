@@ -4,6 +4,18 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.25.3
+
+### Fixed
+
+- **Delete failed on every helper.** It asked for a websocket command
+  `config_entries/delete`, which does not exist — Home Assistant answers
+  `unknown_command`. Deleting a config entry is REST:
+  `DELETE /api/config/config_entries/entry/<id>`, which is what the frontend itself uses.
+  Nothing was ever removed by the broken path; it failed before touching anything.
+- **A failed action now says why in the row**, not only in the button's tooltip. The old
+  behaviour left "Failed" on screen with the reason hidden behind a hover.
+
 ## 2026.8.25.2
 
 - **Delete, next to Open, when the thing holding a broken reference is used by nothing.**
