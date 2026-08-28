@@ -956,6 +956,53 @@
   };
 
   /**
+   * Keys whose value is prose, a URL or a literal event name. Home Assistant
+   * never resolves any of them, so an entity id inside one is documentation,
+   * not a reference - and the audit found a real example: an automation whose
+   * `description` names a deleted sensor on purpose, to explain which sensor
+   * NOT to use. A textual scanner reports that as a broken reference; this
+   * list is what stops it.
+   *
+   * Deliberately short. A key only belongs here if Home Assistant can never
+   * resolve a reference from it - `name` and `title` stay off the list because
+   * a Lovelace card may template them, and that template is a real dependency.
+   */
+  const PROSE_KEYS = new Set([
+    'description', 'example', 'documentation', 'url', 'note', 'comment',
+    'event_type', 'logger', 'unique_id', 'webhook_id',
+  ]);
+
+  /**
+   * Custom cards invent their own option names - `rain_sensor:`,
+   * `power_entity:`, `battery:` - so a structural walk keyed on the documented
+   * slots cannot see them. The audit found 36 such references on this install.
+   *
+   * Regex-scanning every string in a dashboard is how an inspector starts
+   * inventing problems, so the rule is narrow on purpose:
+   *
+   *   - only inside containers we mark weak (dashboard cards, `variables:`)
+   *   - the whole value must be exactly one entity id, nothing else
+   *   - its domain must be one this installation actually has
+   *   - the key must not be prose, and must not be one of the layout and
+   *     styling names below that routinely hold dotted strings
+   *
+   * What survives is recorded as a dependency when it resolves - which is
+   * safe, because "this card mentions an entity that exists" is a fact - and
+   * reported as *unvalidated* when it does not. A guess never becomes a broken
+   * or impaired counter.
+   */
+  const WEAK_SKIP_KEYS = new Set([
+    'type', 'theme', 'icon', 'path', 'navigation_path', 'image', 'format',
+    'unit', 'unit_of_measurement', 'state', 'value', 'template', 'style',
+    'card_mod', 'view_layout', 'grid_options', 'layout', 'tap_action',
+    'hold_action', 'double_tap_action', 'action', 'service', 'perform_action',
+    'device_class', 'aspect_ratio', 'font_family', 'suffix', 'prefix',
+  ]);
+
+  /** One entity id and nothing else. */
+  const WEAK_VALUE_RE = /^[a-z][a-z0-9_]*\.[a-z0-9_]+$/;
+
+  /**
    * Blocks that make up an automation or script, and the label each one gets in
    * a finding's location. Both the pre-2024.10 singular keys and the current
    * plural ones are accepted, because Home Assistant still stores whichever
@@ -1095,6 +1142,11 @@
     for (const key in node) {
       const value = node[key];
 
+      /* Prose is not configuration. The whole branch goes, not just the
+         immediate string, because a folded `description` arrives as one value
+         but a `selector` under a documented field is a structure of its own. */
+      if (PROSE_KEYS.has(key)) continue;
+
       /* `choose` is the one block whose index means something to the user, so
          it is named rather than being swallowed by the generic recursion. */
       if (key === 'choose' && Array.isArray(value)) {
@@ -1134,10 +1186,11 @@
         continue;
       }
 
-      /* Everything else is only interesting for the templates it may contain
-         and for the structure underneath it. */
+      /* Everything else is only interesting for the templates it may contain,
+         for a weak custom-card reference, and for the structure underneath. */
       if (typeof value === 'string') {
         if (TEMPLATE_RE.test(value)) emitTemplate(value, path, emit);
+        else if (o.weak) emitWeak(key, value, path, emit, o);
         continue;
       }
       walkRefs(value, path, emit, o);
@@ -1162,6 +1215,28 @@
       }
       walkRefs(value, path, emit, {});
     }
+  }
+
+  /**
+   * A string in a slot nobody documented, inside a container marked weak.
+   *
+   * See WEAK_SKIP_KEYS for why this is as narrow as it is. The emitted
+   * reference carries `weak: true`, which judgeEntity reads: a weak reference
+   * that resolves is a genuine dependency, and one that does not is reported
+   * as unvalidated rather than broken. Guessing must never light a red counter.
+   */
+  function emitWeak(key, value, path, emit, o) {
+    if (WEAK_SKIP_KEYS.has(key)) return;
+    /* A key that is itself an entity id is a scene's state map or a
+       card_mod selector, not an option name holding a reference. */
+    if (WEAK_VALUE_RE.test(key)) return;
+    const v = value.trim();
+    if (!WEAK_VALUE_RE.test(v)) return;
+    const domain = v.slice(0, v.indexOf('.'));
+    /* Without a domain list there is nothing separating `binary_sensor.foo`
+       from `graphite.dark`, so the rule simply does not run. */
+    if (!o.domains || !o.domains.has(domain)) return;
+    emit({ kind: 'entity', value: v, location: locationOf(path), dynamic: false, weak: true });
   }
 
   function emitValue(kind, raw, path, emit) {
@@ -1290,6 +1365,21 @@
     return null;
   }
 
+  /**
+   * The verdict on a weak reference that did not resolve. Recorded so the
+   * coverage is honest and the reader can see what the walk suspected, never
+   * counted among the things that are actually wrong.
+   */
+  function weakUnvalidated(ref, value, why) {
+    return {
+      confidence: 'unvalidated', kind: 'entity', ref: value, location: ref.location,
+      weak: true,
+      message: why === 'disabled'
+        ? 'Possible reference in a card option, and that entity is disabled: ' + value
+        : 'Possible reference in a card option, and no such entity: ' + value,
+    };
+  }
+
   function judgeEntity(ref, index, forceNoun) {
     const value = ref.value;
 
@@ -1329,11 +1419,14 @@
     }
 
     if (verdict === 'disabled') {
+      if (ref.weak) return weakUnvalidated(ref, value, 'disabled');
       return {
         confidence: 'warning', kind: 'entity-disabled', ref: value, location: ref.location,
         message: 'Referenced ' + noun + ' is disabled: ' + value,
       };
     }
+    /* A guess that turned out to point at nothing is a guess, not a break. */
+    if (ref.weak) return weakUnvalidated(ref, value, 'missing');
     return {
       confidence: index.hasRegistry ? 'verified' : 'warning',
       kind: 'entity', ref: value, location: ref.location,
@@ -1345,13 +1438,23 @@
     };
   }
 
-  /** Collects, judges and de-duplicates the findings of one configuration item. */
-  function findingsOf(walk, index) {
+  /**
+   * Collects, judges and de-duplicates the findings of one configuration item.
+   *
+   * It also records the entity references that *resolve*. A reference to an
+   * entity that exists is not a finding, but it is a dependency: if that entity
+   * later goes unavailable, this item stops working while remaining perfectly
+   * valid. Collecting them here costs one lookup per reference on a scan that
+   * is already looking every reference up, and it is what the whole impaired
+   * join is built on. `deps` is attached to the item by the caller.
+   */
+  function findingsOf(walk, index, deps) {
     const raw = [];
     walk((ref) => raw.push(ref));
     const out = [];
     const seen = new Set();
     for (const ref of raw) {
+      if (deps && ref.value && !ref.dynamic) noteDependency(ref, index, deps);
       const f = judge(ref, index);
       if (!f) continue;
       /* The same missing entity named in three actions is three findings, but
@@ -1364,7 +1467,193 @@
     return out;
   }
 
-  const CONFIDENCE_ORDER = { verified: 0, warning: 1, unvalidated: 2 };
+  /**
+   * Records a reference that points at something real.
+   *
+   * `script.foo` arrives as a service reference but is an entity, and that is
+   * the form the runtime join needs - the same normalisation judge() already
+   * does for its own reasons.
+   */
+  function noteDependency(ref, index, deps) {
+    let value = ref.value;
+    if (ref.kind === 'service') {
+      const dot = String(value).indexOf('.');
+      if (dot < 0) return;
+      const domain = value.slice(0, dot);
+      const name = value.slice(dot + 1);
+      if (domain !== 'script' || ['turn_on', 'turn_off', 'toggle', 'reload'].includes(name)) return;
+    } else if (ref.kind !== 'entity') {
+      return;
+    }
+    if (!ENTITY_ID_RE.test(value)) return;
+    if (index.entity(value) !== 'exists') return;
+    /* Keeping the locations, not just the id: "Condition #2" is the difference
+       between a report and a lead. Capped because one dashboard can name the
+       same sensor in thirty cards and the list stops being readable long
+       before that. */
+    let at = deps.get(value);
+    if (!at) deps.set(value, (at = []));
+    if (ref.location && at.length < 8 && at.indexOf(ref.location) < 0) at.push(ref.location);
+  }
+
+  /* Ordering, and the severity ladder the page reads from. `impaired` sits
+     between the two: the configuration is structurally sound, but something it
+     depends on is not answering, so it cannot do its job today. */
+  const CONFIDENCE_ORDER = { verified: 0, impaired: 1, warning: 2, unvalidated: 3 };
+
+  /* ---- ignore rules ----
+   *
+   * Findings the user has looked at and accepted. The rules live in
+   * /config/config_health_ignores.json, written by the backend services and
+   * republished on the scan entity, so the same answer holds on every wall
+   * tablet and survives a restart - which browser storage would not, on an
+   * install with thirteen accounts.
+   *
+   * An ignored finding is moved aside rather than deleted: it stops counting,
+   * stops putting a card on the page, and stays readable under "Ignored" so a
+   * rule can be taken back.
+   */
+
+  /** A glob over references. `*` and `?` only; everything else is a literal. */
+  function globToRe(pattern) {
+    let out = '^';
+    for (const ch of String(pattern)) {
+      if (ch === '*') out += '.*';
+      else if (ch === '?') out += '.';
+      else if ('.+^${}()|[]/'.indexOf(ch) >= 0) out += '[' + ch + ']';
+      else if (ch === String.fromCharCode(92)) out += String.fromCharCode(92, 92);
+      else out += ch;
+    }
+    return new RegExp(out + '$');
+  }
+
+  function compileIgnores(rules) {
+    const out = [];
+    for (const rule of rules || []) {
+      if (!rule || !rule.scope || !rule.value) continue;
+      const c = { id: rule.id || rule.scope + ':' + rule.value, rule };
+      if (rule.scope === 'pattern') {
+        try { c.re = globToRe(rule.value); } catch (e) { continue; }
+      }
+      out.push(c);
+    }
+    return out;
+  }
+
+  /** Does this rule cover this finding, on this item? */
+  function ignoreMatches(c, issue, item, hass) {
+    const rule = c.rule;
+    const ref = issue.ref == null ? '' : String(issue.ref);
+    switch (rule.scope) {
+      case 'ref':
+        return ref === rule.value;
+      case 'pattern':
+        return !!ref && c.re.test(ref);
+      case 'item':
+        return item.key === rule.value || item.entityId === rule.value ||
+          item.urlPath === rule.value || item.id === rule.value;
+      case 'kind':
+        /* A kind rule may be install-wide or pinned to one item, which is the
+           difference between "stop telling me about disabled entities" and
+           "stop telling me about this one dashboard's disabled entities". */
+        if (issue.kind !== rule.value) return false;
+        if (!rule.item) return true;
+        return item.key === rule.item || item.entityId === rule.item || item.urlPath === rule.item;
+      case 'label':
+        return entityCarriesLabel(hass, ref, rule.value);
+      default:
+        return false;
+    }
+  }
+
+  /** A label on the entity itself, or on the device it belongs to. */
+  function entityCarriesLabel(hass, entityId, label) {
+    if (!entityId || !hass) return false;
+    const reg = (hass.entities || {})[entityId];
+    if (!reg) return false;
+    if (Array.isArray(reg.labels) && reg.labels.indexOf(label) >= 0) return true;
+    const dev = reg.device_id && (hass.devices || {})[reg.device_id];
+    return !!(dev && Array.isArray(dev.labels) && dev.labels.indexOf(label) >= 0);
+  }
+
+  /**
+   * Moves every covered finding out of the actionable set.
+   *
+   * Idempotent: previously ignored findings are folded back in first, so the
+   * pass can run again after a rule is added or withdrawn without a rescan.
+   */
+  function applyIgnores(config, rules, hass) {
+    if (!config || !config.items) return config;
+    const compiled = compileIgnores(rules);
+    config.ignoreRules = rules || [];
+    /* Nothing to hide and nothing hidden: the counters applyRuntime just
+       rebuilt are already right, and this runs on every state change. */
+    if (!compiled.length && !config.items.some((i) => i.ignoredIssues && i.ignoredIssues.length)) {
+      if (config.counts) { config.counts.ignoredFindings = 0; config.counts.ignoredItems = 0; }
+      return config;
+    }
+    let findings = 0;
+    let hitItems = 0;
+    for (const item of config.items) {
+      if (item.ignoredIssues && item.ignoredIssues.length) {
+        item.issues = item.issues.concat(item.ignoredIssues);
+      }
+      item.ignoredIssues = [];
+      if (compiled.length) {
+        const keep = [];
+        for (const issue of item.issues) {
+          let hit = null;
+          for (const c of compiled) {
+            if (ignoreMatches(c, issue, item, hass)) { hit = c; break; }
+          }
+          if (hit) {
+            issue.ignoredBy = hit.id;
+            item.ignoredIssues.push(issue);
+          } else {
+            delete issue.ignoredBy;
+            keep.push(issue);
+          }
+        }
+        item.issues = keep;
+        if (item.ignoredIssues.length) { hitItems++; findings += item.ignoredIssues.length; }
+      }
+      summariseItem(item);
+    }
+    const summary = summariseConfig(config.items, config.counts && config.counts.scanned);
+    config.counts = summary.counts;
+    config.problems = summary.display;
+    config.counts.ignoredFindings = findings;
+    config.counts.ignoredItems = hitItems;
+    config.healthy = summary.counts.brokenTotal === 0 && summary.counts.other === 0 &&
+      summary.counts.impairedItems === 0;
+    return config;
+  }
+
+  /**
+   * What a rule would hide, worked out before it is written.
+   *
+   * A wildcard is the one ignore scope that can quietly bury a hundred real
+   * problems, so the confirmation says how many findings it covers and names
+   * the first few. Returns { findings, items, refs, sample }.
+   */
+  function ignorePreview(config, rule, hass) {
+    const compiled = compileIgnores([rule]);
+    const refs = new Set();
+    const items = new Set();
+    const sample = [];
+    let findings = 0;
+    for (const item of (config && config.items) || []) {
+      const all = item.issues.concat(item.ignoredIssues || []);
+      for (const issue of all) {
+        if (!compiled.length || !ignoreMatches(compiled[0], issue, item, hass)) continue;
+        findings++;
+        items.add(item.key);
+        if (issue.ref) refs.add(String(issue.ref));
+        if (sample.length < 5) sample.push(item.name + ' — ' + issue.message);
+      }
+    }
+    return { findings, items: items.size, refs: refs.size, sample };
+  }
 
   function summariseItem(item) {
     item.issues.sort((a, b) => {
@@ -1372,10 +1661,50 @@
       return c || String(a.location).localeCompare(String(b.location));
     });
     item.verified = item.issues.filter((i) => i.confidence === 'verified').length;
+    item.impaired = item.issues.filter((i) => i.confidence === 'impaired').length;
     item.warnings = item.issues.filter((i) => i.confidence === 'warning').length;
     item.unvalidated = item.issues.filter((i) => i.confidence === 'unvalidated').length;
-    item.band = item.verified ? 'critical' : item.warnings ? 'warn' : 'unknown';
+    /* Broken outranks impaired outranks warning: a reference that does not
+       exist is worse news than one that is merely silent today. */
+    item.band = item.verified ? 'critical' : item.impaired ? 'impaired' : item.warnings ? 'warn' : 'unknown';
     return item;
+  }
+
+  /**
+   * The top-level keys of an automation or script that can hold a live
+   * reference, walked after the blocks.
+   *
+   * This used to be a hole: the walk was pointed at `triggers`, `conditions`,
+   * `actions` and `sequence` only, so a `variables:` block above them was
+   * invisible - and a script that resolves its whole behaviour from
+   * `variables: { dry_run: "{{ is_state('input_boolean.x', 'on') }}" }` had
+   * none of it seen.
+   *
+   * `variables` and `trigger_variables` are walked weak, because their keys are
+   * whatever the author chose. `fields` is treated with more care: a script's
+   * `description`, `example` and `selector` are documentation for the run
+   * dialog, and only `default` becomes a real value at run time.
+   */
+  function walkTopLevel(cfg, type, emit, index) {
+    const weak = { weak: true, domains: index.domains };
+    for (const key of ['variables', 'trigger_variables']) {
+      const block = cfg[key];
+      if (block && typeof block === 'object') {
+        walkRefs(block, [key === 'variables' ? 'Variables' : 'Trigger variables'], emit, weak);
+      }
+    }
+    if (type !== 'script' || !cfg.fields || typeof cfg.fields !== 'object') return;
+    for (const name in cfg.fields) {
+      const field = cfg.fields[name];
+      if (!field || typeof field !== 'object' || field.default === undefined) continue;
+      const at = ['Field “' + name + '” default'];
+      if (typeof field.default === 'string') {
+        if (TEMPLATE_RE.test(field.default)) emitTemplate(field.default, at, emit);
+        else emitWeak('default', field.default, at, emit, weak);
+      } else {
+        walkRefs(field.default, at, emit, weak);
+      }
+    }
   }
 
   /**
@@ -1414,6 +1743,7 @@
     item.inspected = true;
     item.name = cfg.alias || entry.name;
 
+    item.deps = new Map();
     item.issues = findingsOf((emit) => {
       if (cfg.use_blueprint) {
         /* A blueprint's inputs are arbitrary keys whose meaning lives in the
@@ -1428,16 +1758,17 @@
         const seq = cfg.sequence;
         if (Array.isArray(seq)) seq.forEach((step, i) => walkRefs(step, ['Action #' + (i + 1)], emit, {}));
         else walkRefs(seq, [], emit, {});
-        return;
+      } else {
+        for (const block of AUTOMATION_BLOCKS) {
+          const key = block.keys.find((k) => cfg[k] !== undefined);
+          if (!key) continue;
+          const value = cfg[key];
+          const list = Array.isArray(value) ? value : [value];
+          list.forEach((step, i) => walkRefs(step, [block.label + ' #' + (i + 1)], emit, {}));
+        }
       }
-      for (const block of AUTOMATION_BLOCKS) {
-        const key = block.keys.find((k) => cfg[k] !== undefined);
-        if (!key) continue;
-        const value = cfg[key];
-        const list = Array.isArray(value) ? value : [value];
-        list.forEach((step, i) => walkRefs(step, [block.label + ' #' + (i + 1)], emit, {}));
-      }
-    }, index);
+      walkTopLevel(cfg, type, emit, index);
+    }, index, item.deps);
 
     return summariseItem(item);
   }
@@ -1468,9 +1799,10 @@
     }
     item.inspected = true;
     item.name = cfg.name || entry.name;
+    item.deps = new Map();
     item.issues = findingsOf((emit) => {
       emitSlot('entity', cfg.entities || {}, ['Entities'], emit, 'entities');
-    }, index);
+    }, index, item.deps);
     return summariseItem(item);
   }
 
@@ -1494,6 +1826,7 @@
     if (!cfg || typeof cfg !== 'object' || !Array.isArray(cfg.views)) return summariseItem(item);
 
     item.inspected = true;
+    item.deps = new Map();
     const customTags = new Set();
     let cards = 0;
 
@@ -1523,10 +1856,13 @@
             cards++;
             const seg = (c.prefix ? [c.prefix] : []).concat(c.label + ' #' + (ci + 1));
             collectCustomTags(card, customTags);
-            walkRefs(card, base.concat(seg), emit, {});
+            /* Weak: a card's own option names are the custom card's business,
+               not Home Assistant's, so `rain_sensor:` has to be recognised by
+               the shape of its value rather than by the slot. */
+            walkRefs(card, base.concat(seg), emit, { weak: true, domains: index.domains });
           });
         }
-      }, index);
+      }, index, item.deps);
 
       for (const f of found) {
         f.viewName = viewName;
@@ -1642,8 +1978,382 @@
        full of templated service calls is normal, well-written configuration.
        Those findings are still counted, so the coverage note stays honest, but
        they never put a card on the page. */
+    const summary = summariseConfig(items, scanned);
+    return {
+      items,
+      problems: summary.display,
+      counts: summary.counts,
+      /* Kept so the runtime join can ask the same existence questions the scan
+         asked, rather than re-deriving "disabled" from a second source. */
+      index,
+      healthy: summary.counts.brokenTotal === 0 && summary.counts.other === 0 &&
+        summary.counts.impairedItems === 0,
+    };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * The runtime join
+   *
+   * A configuration item can be structurally perfect and still be unable to
+   * work, because something it depends on is not answering. That is neither a
+   * broken reference nor a healthy one, so it gets its own tier: IMPAIRED.
+   *
+   * The join is deliberately one-directional and index-driven. Every item
+   * already carries the set of entities it references and that exist; turning
+   * that into `entity -> items` once per scan means a state change is answered
+   * by a lookup on the handful of entities that are actually unavailable,
+   * never by walking automations again.
+   * ------------------------------------------------------------------ */
+
+  /** Only these mean "cannot work". `off`, `closed`, `idle` and friends do not. */
+  const IMPAIRED_STATES = { unavailable: 'entity-unavailable', unknown: 'entity-unknown' };
+
+  /**
+   * entity_id -> {name, deviceId} for naming the device behind an impaired
+   * reference. Cached on the registry objects themselves: they are replaced
+   * wholesale when anything in the registry changes, so identity is a free and
+   * exact cache key.
+   */
+  let deviceIndexCache = null;
+  function dependencyDeviceIndex(hass) {
+    if (deviceIndexCache && deviceIndexCache.e === hass.entities && deviceIndexCache.d === hass.devices) {
+      return deviceIndexCache.map;
+    }
+    const map = new Map();
+    const entities = hass.entities || {};
+    const devices = hass.devices || {};
+    for (const id in entities) {
+      const did = entities[id].device_id;
+      if (!did) continue;
+      const dev = devices[did];
+      if (!dev) continue;
+      map.set(id, { deviceId: did, name: dev.name_by_user || dev.name || did });
+    }
+    deviceIndexCache = { e: hass.entities, d: hass.devices, map };
+    return map;
+  }
+
+  /* Owner kinds the backend can report, and the item they become on the page.
+     `yaml` and `helper` have no browser-side counterpart at all: nothing in the
+     frontend can read templates.yaml or a utility meter's config entry, which
+     is exactly why those references were outside the join. */
+  const FILE_OWNER_TYPE = {
+    automation: 'automation', script: 'script', scene: 'scene',
+    dashboard: 'dashboard', file: 'yaml', entry: 'helper',
+  };
+
+  /**
+   * Folds the file scanner's dependency universe into the card's.
+   *
+   * The audit measured the hole this closes: the browser tracked 287 entities
+   * while the configuration actually names 358, so 71 of them could go
+   * unavailable without anything on the page noticing. The browser cannot read
+   * YAML packages, templates.yaml or a helper's config entry, and it never
+   * will - so the backend hands over the edges it found and this merges them
+   * into the same index, under the same rules.
+   *
+   * Deduplication is by (item, entity): a reference both scanners found is one
+   * dependency with two witnesses, never two rows saying the same thing. The
+   * structural location wins when there is one, because "Trigger #1" is worth
+   * more than "automations.yaml:935".
+   */
+  /**
+   * Resolves a file-side owner to the item it belongs on, creating one only
+   * when the browser has no counterpart. Shared by the dependency merge and
+   * the missing-reference merge so both halves land on the same card.
+   */
+  function fileOwnerResolver(config) {
+    const byAutomation = new Map();
+    const byScript = new Map();
+    const byDashboard = new Map();
+    const byKey = new Map();
+    for (const item of config.items) {
+      byKey.set(item.key, item);
+      if (item.type === 'automation' && item.id != null) byAutomation.set(String(item.id), item);
+      if (item.type === 'script' && item.entityId) byScript.set(item.entityId.slice(7), item);
+      if (item.type === 'dashboard' && item.urlPath) byDashboard.set(item.urlPath, item);
+    }
+    return (own) => {
+      if (own.k === 'automation' && byAutomation.has(String(own.i))) return byAutomation.get(String(own.i));
+      if (own.k === 'script' && byScript.has(own.i)) return byScript.get(own.i);
+      if (own.k === 'dashboard' && byDashboard.has(own.i)) return byDashboard.get(own.i);
+      const type = FILE_OWNER_TYPE[own.k] || 'other';
+      const key = own.k + ':' + own.i;
+      if (byKey.has(key)) return byKey.get(key);
+      const item = {
+        type,
+        key,
+        entityId: null,
+        id: own.i || null,
+        name: own.t || (own.k === 'file' ? String(own.i).split('/').pop() : String(own.i)),
+        issues: [],
+        inspected: true,
+        fileOnly: true,
+        entryId: own.k === 'entry' ? own.i : null,
+        entryDomain: own.d || null,
+        file: own.f || null,
+        deps: new Map(),
+      };
+      byKey.set(key, item);
+      config.items.push(item);
+      return item;
+    };
+  }
+
+  function mergeFileDeps(config, payload) {
+    if (!config || !config.items || !payload || !Array.isArray(payload.deps)) return config;
+    config.fileDeps = payload;
+
+    const owned = fileOwnerResolver(config);
+
+    let merged = 0;
+    let added = 0;
+    for (const dep of payload.deps) {
+      const entity = dep.e;
+      if (!entity || !Array.isArray(dep.o)) continue;
+      for (const own of dep.o) {
+        const item = owned(own);
+        if (!item.deps) item.deps = new Map();
+        if (!item.fileSeen) item.fileSeen = new Map();
+        const where = own.p
+          ? own.t
+            ? own.p
+            : own.f + ' → ' + own.p
+          : own.f + ':' + own.l;
+        const seen = item.fileSeen.get(entity) || [];
+        if (seen.indexOf(where) < 0 && seen.length < 4) seen.push(where);
+        item.fileSeen.set(entity, seen);
+        if (item.deps.has(entity)) { merged++; continue; }
+        item.deps.set(entity, []);
+        added++;
+      }
+    }
+    /* The index is derived from the items, so it has to be thrown away or the
+       new edges would never be joined. */
+    config.depIndex = null;
+    config.fileDepStats = { entities: payload.deps.length, merged, added };
+    return config;
+  }
+
+  /**
+   * Folds the file scanner's *broken* references into the same items.
+   *
+   * The browser and the file scanner overlap: both read automations.yaml, one
+   * through the automation editor and one off the disk. When both see the same
+   * dangling reference it is one finding with two witnesses - never two rows
+   * saying the same sentence because two different programs said it.
+   *
+   * A reference only the file scanner can see - in a YAML package, or in a
+   * helper's config entry - becomes a finding on an owner item of its own,
+   * which is the only way it reaches the page at all.
+   */
+  function mergeFileMissing(config, list) {
+    if (!config || !config.items || !Array.isArray(list)) return config;
+    const owned = fileOwnerResolver(config);
+    let confirmed = 0;
+    let fromFile = 0;
+    for (const rec of list) {
+      const ref = rec && rec.entity_id;
+      if (!ref) continue;
+      const owners = [];
+      for (const occ of rec.occurrences || []) {
+        const file = occ.file;
+        if (file === '.storage/core.config_entries') continue;
+        const base = String(file).split('/').pop();
+        const kind = { 'automations.yaml': 'automation', 'scripts.yaml': 'script', 'scenes.yaml': 'scene' }[base];
+        if (occ.holder && kind) owners.push({ k: kind, i: occ.holder, f: file, l: occ.line });
+        else if (rec.dashboard) owners.push({ k: 'dashboard', i: rec.dashboard, f: file, l: occ.line });
+        else owners.push({ k: 'file', i: file, f: file, l: occ.line });
+      }
+      for (const own of rec.owners || []) {
+        owners.push({ k: 'entry', i: own.entry_id, t: own.title, d: own.domain, f: '.storage/core.config_entries', p: own.field });
+      }
+      if (!owners.length) owners.push({ k: 'file', i: 'configuration', f: 'configuration', l: 0 });
+
+      const meta = {
+        chFile: (rec.occurrences && rec.occurrences[0] && rec.occurrences[0].file) || null,
+        chLine: (rec.occurrences && rec.occurrences[0] && rec.occurrences[0].line) || null,
+        chSuggestion: rec.suggestion || null,
+        chEditable: rec.editable,
+      };
+      const seenOn = new Set();
+      for (const own of owners) {
+        const item = owned(own);
+        if (seenOn.has(item.key)) continue;
+        seenOn.add(item.key);
+        /* Already found structurally: confirm it rather than repeat it. */
+        const existing = item.issues.filter((i) => i.ref === ref && i.confidence !== 'unvalidated');
+        if (existing.length) {
+          for (const issue of existing) {
+            issue.seenByFile = true;
+            Object.assign(issue, meta);
+          }
+          confirmed++;
+          continue;
+        }
+        /* The walk did look here and called it unvalidated - a template it
+           could not resolve. The file scanner resolved it and found nothing,
+           so the guess becomes a fact. */
+        const guessed = item.issues.filter((i) => i.ref === ref && i.confidence === 'unvalidated');
+        if (guessed.length) {
+          for (const issue of guessed) {
+            issue.confidence = 'verified';
+            issue.seenByFile = true;
+            Object.assign(issue, meta);
+          }
+          confirmed++;
+          continue;
+        }
+        item.issues.push(Object.assign({
+          confidence: 'verified',
+          kind: 'entity',
+          ref,
+          location: own.p || (own.l ? own.f + ':' + own.l : own.f),
+          message: 'Missing entity: ' + ref,
+          fromFile: true,
+          seenByFile: true,
+          renamedTo: config.index && config.index.renameHint ? config.index.renameHint(ref) : null,
+        }, meta));
+        fromFile++;
+      }
+    }
+    for (const item of config.items) summariseItem(item);
+    const summary = summariseConfig(config.items, config.counts && config.counts.scanned);
+    config.counts = summary.counts;
+    config.problems = summary.display;
+    config.fileMissingStats = { records: list.length, confirmed, fromFile };
+    config.healthy = summary.counts.brokenTotal === 0 && summary.counts.other === 0 &&
+      summary.counts.impairedItems === 0;
+    return config;
+  }
+
+  function buildDependencyIndex(items) {
+    const index = new Map();
+    for (const item of items) {
+      if (!item.deps) continue;
+      for (const id of item.deps.keys()) {
+        let list = index.get(id);
+        if (!list) index.set(id, (list = []));
+        list.push(item);
+      }
+    }
+    return index;
+  }
+
+  /**
+   * Rewrites the impaired findings from current state.
+   *
+   * Called whenever the runtime picture changes, so it must be idempotent:
+   * every previously injected finding is dropped first, and the surviving
+   * findings are the ones the scan itself produced.
+   */
+  function applyRuntime(config, hass, deviceIndex) {
+    if (!config || !config.items) return config;
+    if (!config.depIndex) config.depIndex = buildDependencyIndex(config.items);
+
+    const touched = new Set();
+    for (const item of config.items) {
+      if (item.hasRuntime) {
+        item.issues = item.issues.filter((i) => !i.runtime);
+        /* A runtime finding that an ignore rule moved aside still has to go,
+           or the next pass would fold a stale one back in. */
+        if (item.ignoredIssues) item.ignoredIssues = item.ignoredIssues.filter((i) => !i.runtime);
+        item.hasRuntime = false;
+        touched.add(item);
+      }
+    }
+
+    const states = hass.states || {};
+    const index = config.index || null;
+    for (const [entityId, items] of config.depIndex) {
+      const st = states[entityId];
+      /* One classification, used by both scanners. Precedence is fixed:
+         missing beats disabled beats unavailable beats unknown, and everything
+         else - off, closed, idle, standby - is a working entity doing its job.
+         A dependency that has since been deleted outright is reported as
+         broken here rather than silently dropped, which is what used to happen
+         to a reference the file scanner found and the browser could not see. */
+      let confidence = null;
+      let kind = null;
+      let message = null;
+      const verdict = index ? index.entity(entityId) : (st ? 'exists' : 'missing');
+      if (verdict === 'missing') {
+        confidence = 'verified';
+        kind = 'entity';
+        message = 'Missing entity: ' + entityId;
+      } else if (verdict === 'disabled') {
+        confidence = 'warning';
+        kind = 'entity-disabled';
+        message = 'Referenced entity is disabled: ' + entityId;
+      } else if (st && IMPAIRED_STATES[st.state]) {
+        confidence = 'impaired';
+        kind = IMPAIRED_STATES[st.state];
+        message = 'Referenced entity is ' + st.state + ': ' + entityId;
+      }
+      if (!confidence) continue;
+      const since = st ? st.last_changed || null : null;
+      /* The device the entity belongs to, so a reader can go from "this
+         automation cannot run" to "because that device is offline" without
+         holding both halves of the page in their head. */
+      const dev = deviceIndex ? deviceIndex.get(entityId) : null;
+      for (const item of items) {
+        item.issues.push({
+          confidence,
+          kind,
+          ref: entityId,
+          runtime: true,
+          location: locationsFor(item, entityId),
+          since: confidence === 'impaired' ? since : null,
+          device: dev || null,
+          message,
+        });
+        item.hasRuntime = true;
+        touched.add(item);
+      }
+    }
+    for (const item of touched) summariseItem(item);
+    /* The counters and the visible list are derived from the items, so they
+       have to be rebuilt here too - otherwise the page would show an impaired
+       card while the summary above it still read zero. */
+    if (touched.size || !config.countsFrom) {
+      const summary = summariseConfig(config.items, config.counts && config.counts.scanned);
+      config.counts = summary.counts;
+      config.problems = summary.display;
+      config.healthy =
+        summary.counts.brokenTotal === 0 && summary.counts.other === 0 && summary.counts.impairedItems === 0;
+      config.countsFrom = 'runtime';
+    }
+    return config;
+  }
+
+  /**
+   * Where in the item the entity is named. The scan does not keep a location
+   * for a reference that resolved - there was nothing to report - so this is
+   * recovered from the findings that do carry one, and falls back to a plain
+   * count. Showing "5 places" beats showing the same row five times.
+   */
+  function locationsFor(item, entityId) {
+    const at = item.deps && item.deps.get(entityId);
+    /* The structural location reads better than a file offset, so it wins when
+       both scanners saw the same reference; the file location is the only one
+       there is for a YAML package or a helper's config entry. */
+    const list = at && at.length ? at : (item.fileSeen && item.fileSeen.get(entityId)) || [];
+    if (!list.length) return null;
+    if (list.length <= 2) return list.join(', ');
+    return list[0] + ' and ' + (list.length - 1) + ' more';
+  }
+
+  /**
+   * The counters and the display list, derived from the items.
+   *
+   * Pulled out of the scan because the runtime join rewrites findings
+   * afterwards and the numbers have to follow. Called once by the scan and
+   * again by every runtime pass; it reads items and returns, holding no
+   * state of its own.
+   */
+  function summariseConfig(items, scanned) {
     const flagged = items.filter((i) => i.issues.length);
-    const problems = flagged.filter((i) => i.verified || i.warnings);
+    const problems = flagged.filter((i) => i.verified || i.impaired || i.warnings);
     const broken = problems.filter((i) => i.verified);
     const byType = (t) => broken.filter((i) => i.type === t).length;
 
@@ -1662,8 +2372,27 @@
       /* "Other" collects the problems that belong to no single automation,
          script or dashboard, and counts them whether verified or only
          suspected - there is no separate warning counter for them. */
-      other: problems.filter((i) => i.type === 'other').length,
+      /* A YAML package or a helper only ever reaches the page through the file
+         scanner, and only a verified finding there is "broken": one whose
+         source has merely gone quiet is impaired, and impaired is not
+         something the broken counter is allowed to swallow. */
+      other: problems.filter(
+        (i) => i.type === 'other' || ((i.type === 'yaml' || i.type === 'helper') && i.verified)
+      ).length,
       verifiedIssues: verified.length,
+      /* Items, not findings: one automation naming the same silent sensor in
+         five conditions is one impaired automation, not five. */
+      impairedItems: items.filter((i) => i.impaired && !i.verified).length,
+      impairedAutomations: items.filter((i) => i.impaired && !i.verified && i.type === 'automation').length,
+      impairedScripts: items.filter((i) => i.impaired && !i.verified && i.type === 'script').length,
+      impairedScenes: items.filter((i) => i.impaired && !i.verified && i.type === 'scene').length,
+      impairedDashboards: items.filter((i) => i.impaired && !i.verified && i.type === 'dashboard').length,
+      impairedFiles: items.filter((i) => i.impaired && !i.verified && i.type === 'yaml').length,
+      impairedHelpers: items.filter((i) => i.impaired && !i.verified && i.type === 'helper').length,
+      impairedRefs: new Set(all.filter((x) => x.issue.confidence === 'impaired').map((x) => x.issue.ref)).size,
+      disabledRefs: new Set(
+        all.filter((x) => x.issue.kind === 'entity-disabled').map((x) => x.issue.ref)
+      ).size,
       warnings: all.filter((x) => x.issue.confidence === 'warning').length,
       unvalidated: all.filter((x) => x.issue.confidence === 'unvalidated').length,
       missingEntities: countRefs((x) => x.issue.confidence === 'verified' && x.issue.kind === 'entity'),
@@ -1687,11 +2416,12 @@
 
     display.sort((a, b) => {
       if (a.verified !== b.verified) return b.verified - a.verified;
+      if (a.impaired !== b.impaired) return b.impaired - a.impaired;
       if (a.warnings !== b.warnings) return b.warnings - a.warnings;
       return String(a.name).localeCompare(String(b.name));
     });
 
-    return { items, problems: display, counts, healthy: counts.brokenTotal === 0 && counts.other === 0 };
+    return { counts, display };
   }
 
   /** Below this many, the individual cards are still the clearer answer. */
@@ -3001,29 +3731,90 @@
    * frontend's copy is the display registry and has disabled entities removed -
    * which is precisely the distinction the inspector needs to make.
    */
+  /**
+   * The file scanner's dependency universe.
+   *
+   * A service response rather than a state attribute: several hundred edges do
+   * not belong in the state machine. Absent pyscript, or an older backend, this
+   * simply answers null and the card carries on with what the browser can see.
+   */
+  async function fetchFileDeps(hass) {
+    try {
+      const res = await hass.callWS({
+        type: 'call_service', domain: 'pyscript', service: 'config_health_deps',
+        service_data: {}, return_response: true,
+      });
+      const payload = (res && res.response) || res || null;
+      return payload && Array.isArray(payload.deps) ? payload : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   async function scanConfiguration(hass, cfg) {
-    const [registry, resources, automations, scripts, scenes, dashboards] = await Promise.all([
+    const [registry, resources, automations, scripts, scenes, dashboards, fileDeps] = await Promise.all([
       hass.callWS({ type: 'config/entity_registry/list' }).catch(() => null),
       hass.callWS({ type: 'lovelace/resources' }).catch(() => []),
       fetchScriptLike(hass, 'automation', 'automation/config'),
       fetchScriptLike(hass, 'script', 'script/config'),
       fetchScenes(hass),
       fetchDashboards(hass),
+      fetchFileDeps(hass),
     ]);
 
-    const index = buildIndex(hass, { registry, manifests: cfg.manifests });
-    index.registryList = registry || [];
-    const model = inspectConfiguration(
-      { automations, scripts, scenes, dashboards, resources },
-      index,
-      { isDefined: (tag) => !!window.customElements.get(tag) }
-    );
-    model.hasRegistry = !!registry;
+    const sources = { automations, scripts, scenes, dashboards, resources };
+    const model = inspectSources(hass, cfg, sources, registry);
+    /* Kept so a registry change can be answered by re-judging what is already
+       in hand rather than by 132 fresh round trips. */
+    model.sources = sources;
+    model.registry = registry;
+    if (fileDeps) mergeFileDeps(model, fileDeps);
+    mergeFileMissing(model, backendMissing(hass));
     /* The conflict analysis rides the same fetch: every automation and script
        configuration it needs has just been read for the inspector, so this
        costs no extra round trips. */
-    model.conflicts = analyseConflicts({ automations, scripts }, index, hass, cfg);
+    model.conflicts = analyseConflicts({ automations, scripts }, model.index, hass, cfg);
     model.scannedAt = Date.now();
+    return model;
+  }
+
+  /** The pure half of a scan: everything after the fetching. */
+  function inspectSources(hass, cfg, sources, registry) {
+    const index = buildIndex(hass, { registry, manifests: cfg.manifests });
+    index.registryList = registry || [];
+    const model = inspectConfiguration(sources, index, {
+      isDefined: (tag) => !!window.customElements.get(tag),
+    });
+    model.hasRegistry = !!registry;
+    return model;
+  }
+
+  /**
+   * Re-judge the configuration already in hand against a fresh registry.
+   *
+   * Deleting, renaming, disabling or re-enabling an entity changes what every
+   * reference means without changing a single line of configuration, so the
+   * fetched sources are still good and only the existence index is stale.
+   * Re-inspecting them costs one round trip and about fifteen milliseconds,
+   * against three quarters of a second for a full rescan.
+   */
+  async function reinspectConfiguration(hass, cfg, previous, opts) {
+    if (!previous || !previous.sources) return null;
+    const o = opts || {};
+    const [registry, fresh] = await Promise.all([
+      hass.callWS({ type: 'config/entity_registry/list' }).catch(() => previous.registry),
+      o.refetchDeps ? fetchFileDeps(hass) : Promise.resolve(null),
+    ]);
+    const model = inspectSources(hass, cfg, previous.sources, registry);
+    model.sources = previous.sources;
+    model.registry = registry;
+    const deps = fresh || previous.fileDeps;
+    if (deps) mergeFileDeps(model, deps);
+    mergeFileMissing(model, backendMissing(hass));
+    model.conflicts = previous.conflicts;
+    model.scannedAt = previous.scannedAt;
+    model.reinspectedAt = Date.now();
+    model.ready = true;
     return model;
   }
 
@@ -3238,12 +4029,23 @@
     const cfg = [];
     if (conf && conf.counts) {
       if (num(conf.counts.brokenItems)) cfg.push(line(conf.counts.brokenItems, 'broken item', 'broken items'));
-      if (num(conf.counts.warnings)) cfg.push(line(conf.counts.warnings, 'warning', 'warnings'));
+      /* Impaired belongs here too: an automation that cannot run today is a
+         thing the dashboard should say out loud, and leaving it off made the
+         tile disagree with the page it links to. Distinguished from broken by
+         the band, and never counted as serious - the configuration is sound. */
+      if (num(conf.counts.impairedItems)) cfg.push(line(conf.counts.impairedItems, 'impaired item', 'impaired items'));
+      /* Warnings ride along when the tile is up for a real reason, but never
+         raise it on their own: a disabled entity somebody meant to disable is
+         not a thing to interrupt the main dashboard for. Ignored findings are
+         already absent from every one of these counters. */
+      if (cfg.length && num(conf.counts.warnings)) {
+        cfg.push(line(conf.counts.warnings, 'warning', 'warnings'));
+      }
     }
     if (cfg.length) {
       groups.push({
         key: 'config', label: 'Configuration', items: cfg,
-        band: conf.counts.brokenItems ? 'critical' : 'warn',
+        band: conf.counts.brokenItems ? 'critical' : conf.counts.impairedItems ? 'impaired' : 'warn',
         serious: num(conf.counts.brokenItems),
       });
     }
@@ -3454,6 +4256,42 @@
     other: ['configuration problem', 'Other', 'Config'],
   };
 
+  /**
+   * The operational entities the backend publishes, if it is publishing.
+   *
+   * Read like any other entity: they are real registry entities over MQTT, not
+   * a private channel. Absent them - no pyscript, no broker - the page simply
+   * does not show the line, which is what it did before they existed.
+   */
+  const OPS_STATUS = 'sensor.config_health_status';
+  const OPS_LAST_SCAN = 'sensor.config_health_last_scan';
+
+  function opsInfo(hass) {
+    const st = hass && hass.states && hass.states[OPS_STATUS];
+    if (!st || st.state === 'unavailable' || st.state === 'unknown') return null;
+    const a = st.attributes || {};
+    const scan = hass.states[OPS_LAST_SCAN];
+    let when = null;
+    if (scan && scan.state && scan.state !== 'unknown' && scan.state !== 'unavailable') {
+      const d = new Date(scan.state);
+      if (!isNaN(d)) {
+        const today = new Date();
+        const sameDay = d.toDateString() === today.toDateString();
+        when = (sameDay ? '' : d.toLocaleDateString() + ' ') +
+          String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      }
+    }
+    return {
+      status: st.state,
+      lastScan: when,
+      /* "2026-08-27 04:17" reads better here as just the time when it is
+         tomorrow anyway, which it always is after the nightly run. */
+      next: a.next_scheduled_scan ? String(a.next_scheduled_scan).slice(11) : null,
+      lastSuccessful: a.last_successful_scan || null,
+      error: st.state === 'error' ? (a.error || 'scan failed') : null,
+    };
+  }
+
   function configCompact(conf) {
     /* `ready` is stamped on by the card's cache layer, so its absence just
        means the inspector was called directly; only an explicit false is a
@@ -3464,10 +4302,34 @@
        card stands for 32 broken automations, and the tile has to agree with
        the counter on the full page. */
     const broken = conf.items.filter((i) => i.verified);
-    if (!broken.length) return null;
+    /* Impaired earns the tile too. An automation that cannot run today is
+       worth a glance from the main dashboard, and a page that says so while
+       the tile stays hidden is a page nobody trusts. Warnings and ignored
+       findings deliberately do not: neither is something to do now. */
+    const impaired = conf.items.filter((i) => i.impaired && !i.verified);
+    if (!broken.length && !impaired.length) return null;
+
+    if (!broken.length) {
+      const byImpaired = new Map();
+      for (const i of impaired) byImpaired.set(i.type, (byImpaired.get(i.type) || 0) + 1);
+      const bits = [...byImpaired.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([type, n]) => {
+          const label = (COMPACT_CONFIG_WORD[type] || COMPACT_CONFIG_WORD.other)[1].toLowerCase();
+          return n + ' ' + (n === 1 ? label.replace(/s$/, '') : label);
+        });
+      return {
+        band: 'impaired',
+        icon: 'mdi:cog-clockwise',
+        count: impaired.length,
+        label: 'Config',
+        detail: bits.join(' · ') + ' impaired',
+      };
+    }
 
     const byType = new Map();
     for (const i of broken) byType.set(i.type, (byType.get(i.type) || 0) + 1);
+    const alsoImpaired = impaired.length ? ' · ' + impaired.length + ' impaired' : '';
 
     if (broken.length === 1) {
       const only = broken[0];
@@ -3479,7 +4341,7 @@
         /* One problem can say what kind it is; the name and the fault go to the
            tooltip, and the raw reference stays on the full page. */
         label: (COMPACT_CONFIG_WORD[only.type] || COMPACT_CONFIG_WORD.other)[2],
-        detail: only.name + (first ? ' · ' + shortIssue(first) : ''),
+        detail: only.name + (first ? ' · ' + shortIssue(first) : '') + alsoImpaired,
       };
     }
 
@@ -3495,7 +4357,7 @@
       icon: 'mdi:cog-off-outline',
       count: broken.length,
       label: 'Config',
-      detail: bits.join(' · '),
+      detail: bits.join(' · ') + alsoImpaired,
     };
   }
 
@@ -3614,12 +4476,18 @@
 
   /* ---- configuration health ---------------------------------------- */
 
+  /* Severity, not type. The section below already groups by type, and the
+     DEVICE STATUS strip directly above reads as a severity ladder - matching it
+     keeps one language on the page instead of two. */
   const CONFIG_PILLS = [
-    { key: 'brokenAutomations', label: 'Automations', icon: 'mdi:robot-off-outline' },
-    { key: 'brokenScripts', label: 'Scripts', icon: 'mdi:script-text-outline' },
-    { key: 'brokenScenes', label: 'Scenes', icon: 'mdi:palette-outline' },
-    { key: 'dashboardProblems', label: 'Dashboards', icon: 'mdi:view-dashboard-outline' },
-    { key: 'other', label: 'Other', icon: 'mdi:cog-outline' },
+    { key: 'brokenItems', label: 'Broken', icon: 'mdi:close-octagon-outline', band: 'critical',
+      note: 'references gone' },
+    { key: 'impairedItems', label: 'Impaired', icon: 'mdi:progress-alert', band: 'impaired',
+      note: 'cannot run now' },
+    { key: 'warnings', label: 'Warnings', icon: 'mdi:alert-outline', band: 'unknown',
+      note: 'worth a look' },
+    { key: 'ignoredItems', label: 'Ignored', icon: 'mdi:eye-off-outline', band: 'ok',
+      note: 'accepted' },
   ];
 
   function configSummarySection(model) {
@@ -3644,10 +4512,11 @@
     const c = conf.counts;
     const s = c.scanned;
     const pills = CONFIG_PILLS.map((p) =>
-      '<div class="pill pill-wrap band-critical' + (c[p.key] ? '' : ' is-zero') + '">' +
+      '<div class="pill pill-wrap band-' + p.band + ((c[p.key] || 0) ? '' : ' is-zero') + '">' +
       '<ha-icon icon="' + p.icon + '"></ha-icon>' +
-      '<span class="pnum">' + c[p.key] + '</span>' +
-      '<span class="plabel">' + p.label + '</span></div>'
+      '<span class="pnum">' + (c[p.key] || 0) + '</span>' +
+      '<span class="plabel">' + p.label + '</span>' +
+      '<span class="pnote">' + esc(p.note) + '</span></div>'
     ).join('');
 
     /* The subtitle is the coverage claim, and it has to be honest: an item
@@ -3658,15 +4527,33 @@
       s.scene + ' scenes · ' + s.cards + ' cards';
 
     const extra = [];
-    if (c.warnings) extra.push(c.warnings + (c.warnings === 1 ? ' warning' : ' warnings'));
+    /* The severity pills lost the per-type breakdown, so it lands here where
+       it costs no height. Only the types that actually have something. */
+    const byType = [];
+    const typeLine = (n, word) => { if (n) byType.push(n + ' ' + word + (n === 1 ? '' : 's')); };
+    typeLine(c.brokenAutomations + c.impairedAutomations, 'automation');
+    typeLine(c.brokenScripts + c.impairedScripts, 'script');
+    typeLine(c.brokenScenes + c.impairedScenes, 'scene');
+    typeLine(c.dashboardProblems + c.impairedDashboards, 'dashboard');
+    if (byType.length) extra.push(byType.join(', '));
     if (c.unvalidated) extra.push(c.unvalidated + ' dynamic reference' + (c.unvalidated === 1 ? '' : 's') + ' not checkable');
     if (!conf.hasRegistry) extra.push('entity registry unavailable — findings downgraded');
+    /* When the backend scan is answering, say when it last ran and when it
+       runs next. On the line that already exists - a status panel would push
+       the actual findings further down the page for no gain. A failed scan is
+       not an aside, so that one joins the main list. */
+    const ops = opsInfo(conf.hass);
+    if (ops && ops.error) extra.push('last scan failed · ' + ops.error);
+    const opsNote = ops
+      ? (ops.lastScan ? '<span class="opswhen">scanned ' + esc(ops.lastScan) + '</span>' : '') +
+        (ops.next ? '<span class="opsnext">next ' + esc(ops.next) + '</span>' : '')
+      : '';
 
     return sectionHtml(
       'Configuration health', sub,
       '<div class="pills pills-config">' + pills + '</div>' +
       '<div class="confnote">' +
-      '<span>' + esc(extra.join(' · ')) + '</span>' +
+      '<span>' + esc(extra.join(' · ')) + opsNote + '</span>' +
       '<button class="rescan" type="button" data-rescan="1">' +
       '<ha-icon icon="mdi:refresh"></ha-icon>Rescan</button></div>',
       'sec-config-summary'
@@ -3680,11 +4567,21 @@
     script: { label: 'Script', icon: 'mdi:script-text-outline' },
     scene: { label: 'Scene', icon: 'mdi:palette-outline' },
     dashboard: { label: 'Dashboard', icon: 'mdi:view-dashboard-outline' },
+    /* Owners only the file scanner can see: a YAML package or an included
+       file, and a helper defined by a config entry. */
+    yaml: { label: 'YAML file', icon: 'mdi:file-code-outline' },
+    helper: { label: 'Helper', icon: 'mdi:tune-variant' },
     other: { label: 'Configuration', icon: 'mdi:cog-outline' },
   };
 
+  /* Severity first, then type, in one wrapping row - the same shape the
+     device section uses, so the page has one idea of what a filter looks
+     like. A chip that matches nothing is never rendered. */
   const CONFIG_CHIPS = [
     { id: 'all', label: 'All' },
+    { id: 'sev:broken', label: 'Broken', match: (p) => p.verified > 0 },
+    { id: 'sev:impaired', label: 'Impaired', match: (p) => !p.verified && p.impaired > 0 },
+    { id: 'sev:warning', label: 'Warnings', match: (p) => !p.verified && !p.impaired && p.warnings > 0 },
     { id: 'automation', label: 'Automations' },
     { id: 'script', label: 'Scripts' },
     { id: 'scene', label: 'Scenes' },
@@ -3692,9 +4589,29 @@
     { id: 'other', label: 'Other' },
   ];
 
-  const CONFIDENCE_DOT = { verified: '🔴', warning: '🟠', unvalidated: '⚪' };
+  function configChipMatches(p, id) {
+    if (id === 'all') return true;
+    const chip = CONFIG_CHIPS.find((c) => c.id === id);
+    if (chip && chip.match) return chip.match(p);
+    return p.type === id;
+  }
 
-  function issueHtml(issue) {
+  const CONFIDENCE_DOT = {
+    verified: '🔴', impaired: '🟠', warning: '🟡', unvalidated: '⚪',
+  };
+
+  /** The identity a finding is armed by, stable across a re-render. */
+  function issueKey(item, issue) {
+    return item.key + '|' + issue.kind + '|' + (issue.ref == null ? '' : issue.ref) + '|' + (issue.location || '');
+  }
+
+  function issueHtml(issue, item, state, conf) {
+    /* Ignoring is offered on the full page only, and only for findings that
+       are actually being counted - there is nothing to dismiss about a
+       reference the inspector has already said it could not check. */
+    const armable = item && state && conf && issue.confidence !== 'unvalidated';
+    const key = armable ? issueKey(item, issue) : null;
+    const armed = armable && state.ignoring === key;
     return (
       '<div class="issue is-' + issue.confidence + '">' +
       '<span class="idot">' + CONFIDENCE_DOT[issue.confidence] + '</span>' +
@@ -3704,7 +4621,20 @@
         ? '<span class="ihint">Possible renamed entity: ' + esc(issue.renamedTo) + '</span>'
         : '') +
       (issue.note ? '<span class="ihint">' + esc(issue.note) + '</span>' : '') +
-      '</span></div>'
+      /* The other half of the page already knows why this entity is silent.
+         Naming the device here is what turns two lists into one diagnosis. */
+      (issue.device
+        ? '<span class="ihint idev">Device: <button class="devlink" type="button" data-device="' +
+          esc(issue.device.deviceId) + '">' + esc(issue.device.name) + '</button>' +
+          (issue.since ? ' · ' + esc(durationText(ageOf(issue.since, Date.now()))) : '') + '</span>'
+        : '') +
+      (armed ? ignoreChooserHtml(conf, issue, item, conf.hass) : '') +
+      '</span>' +
+      (armable && !armed
+        ? '<button class="ignbtn" type="button" title="Stop reporting this" data-ignorearm="' + esc(key) + '">' +
+          '<ha-icon icon="mdi:eye-off-outline"></ha-icon></button>'
+        : '') +
+      '</div>'
     );
   }
 
@@ -3741,13 +4671,16 @@
     return '<div class="dlinks">' + buttons.join('') + '</div>';
   }
 
-  function configItemHtml(item, open) {
+  function configItemHtml(item, open, state, conf) {
     const type = CONFIG_TYPE[item.type] || CONFIG_TYPE.other;
+    /* issues are sorted by severity, so the first is the worst - which after
+       the runtime join may be an impaired finding rather than a broken one. */
     const first = item.issues[0];
     const n = item.issues.length;
-    const dot = item.verified ? '🔴' : item.warnings ? '🟠' : '⚪';
+    const dot = item.verified ? '🔴' : item.impaired ? '🟠' : item.warnings ? '🟡' : '⚪';
     const counts = [];
-    if (item.verified) counts.push(item.verified + ' issue' + (item.verified === 1 ? '' : 's'));
+    if (item.verified) counts.push(item.verified + ' broken');
+    if (item.impaired) counts.push(item.impaired + ' impaired');
     if (item.warnings) counts.push(item.warnings + ' warning' + (item.warnings === 1 ? '' : 's'));
     if (item.unvalidated) counts.push(item.unvalidated + ' unchecked');
 
@@ -3770,7 +4703,7 @@
           (item.entityId ? '<span class="mono">' + esc(item.entityId) + '</span>' : '') +
           (item.urlPath ? '<span class="mono">/' + esc(item.urlPath) + '</span>' : '') +
           '</div>' +
-          '<div class="issues">' + item.issues.map(issueHtml).join('') + '</div>' +
+          '<div class="issues">' + item.issues.map((i) => issueHtml(i, item, state, conf)).join('') + '</div>' +
           (item.members
             ? '<div class="ents">' + item.members.map((m) =>
                 '<button class="ent" type="button" data-entity="' + esc(m.entityId) + '">' +
@@ -3989,38 +4922,152 @@
     return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
   };
 
+  /**
+   * The scopes on offer when a finding is dismissed, each with what it would
+   * actually hide.
+   *
+   * The count is not decoration. A wildcard is the one scope that can bury a
+   * hundred real problems in a single tap, so the number of findings it covers
+   * is shown before it is written, not after.
+   */
+  function ignoreScopeOptions(conf, issue, item, hass) {
+    const opts = [];
+    const add = (label, rule) => {
+      const p = ignorePreview(conf, rule, hass);
+      if (!p.findings) return;
+      opts.push({ label, rule, preview: p });
+    };
+    if (issue.ref) add('This reference, everywhere', { scope: 'ref', value: String(issue.ref) });
+    add('Findings like this one, here', { scope: 'kind', value: issue.kind, item: item.key });
+    add('Everything on this item', { scope: 'item', value: item.key });
+    /* A pattern is only worth offering when it covers more than the exact
+       reference already does - otherwise it is a wildcard with no upside. */
+    const pattern = suggestPattern(issue.ref);
+    if (pattern) {
+      const p = ignorePreview(conf, { scope: 'pattern', value: pattern }, hass);
+      if (p.refs > 1) opts.push({ label: 'Pattern ' + pattern, rule: { scope: 'pattern', value: pattern }, preview: p, wide: true });
+    }
+    return opts;
+  }
+
+  /** `sensor.hall_battery` suggests `sensor.*_battery`, and nothing else does. */
+  function suggestPattern(ref) {
+    if (!ref || !ENTITY_ID_RE.test(String(ref))) return null;
+    const dot = ref.indexOf('.');
+    const parts = ref.slice(dot + 1).split('_');
+    if (parts.length < 2) return null;
+    return ref.slice(0, dot) + '.*_' + parts[parts.length - 1];
+  }
+
+  function ignoreChooserHtml(conf, issue, item, hass) {
+    const opts = ignoreScopeOptions(conf, issue, item, hass);
+    if (!opts.length) return '';
+    return (
+      '<div class="ignwrap">' +
+      '<div class="ignq">Stop reporting this?</div>' +
+      opts.map((o) =>
+        '<button class="ignopt' + (o.wide ? ' wide' : '') + '" type="button" data-ignoreapply="' +
+        esc(JSON.stringify(o.rule)) + '">' +
+        '<span class="ignlabel">' + esc(o.label) + '</span>' +
+        '<span class="ignhit">hides ' + o.preview.findings +
+        (o.preview.findings === 1 ? ' finding' : ' findings') +
+        (o.preview.items > 1 ? ' across ' + o.preview.items + ' items' : '') + '</span></button>'
+      ).join('') +
+      '<button class="ignopt ignx" type="button" data-ignorecancel="1">Cancel</button>' +
+      '</div>'
+    );
+  }
+
+  /**
+   * The rules currently in force, and what each of them is hiding.
+   *
+   * Ignored findings are set aside rather than deleted, so this is the whole
+   * of what the page is not telling you - and every rule can be taken back
+   * from the same place it is listed.
+   */
+  function ignoredHtml(conf, state) {
+    const rules = conf.ignoreRules || [];
+    if (!rules.length) return '';
+    const hidden = new Map();
+    for (const item of conf.items) {
+      for (const issue of item.ignoredIssues || []) {
+        const key = issue.ignoredBy;
+        if (!hidden.has(key)) hidden.set(key, []);
+        hidden.get(key).push({ item, issue });
+      }
+    }
+    const open = state.open.has('ignored');
+    const rows = rules.map((rule) => {
+      const id = rule.id || rule.scope + ':' + rule.value;
+      const hits = hidden.get(id) || [];
+      return (
+        '<div class="ignrule">' +
+        '<div class="ignrtext"><span class="ignrscope">' + esc(rule.scope) + '</span>' +
+        '<span class="mono">' + esc(rule.value) + (rule.item ? ' · ' + esc(rule.item) : '') + '</span>' +
+        '<span class="ignrhits">' + (hits.length
+          ? hits.length + (hits.length === 1 ? ' finding hidden' : ' findings hidden')
+          : 'nothing matches it now') + '</span>' +
+        (hits.length
+          ? '<span class="ignrsample">' + esc(hits.slice(0, 3).map((h) => h.item.name + ' — ' + h.issue.message).join(' · ')) +
+            (hits.length > 3 ? ' …' : '') + '</span>'
+          : '') +
+        '</div>' +
+        '<button class="devbtn" type="button" data-unignore="' + esc(id) + '">' +
+        '<ha-icon icon="mdi:eye-outline"></ha-icon>Show again</button>' +
+        '</div>'
+      );
+    });
+    return (
+      '<div class="ignsec' + (open ? ' is-open' : '') + '">' +
+      '<button class="probhead" type="button" data-toggle="ignored" aria-expanded="' + (open ? 'true' : 'false') + '">' +
+      '<span class="picon cdot">🙈</span>' +
+      '<span class="ptext"><span class="pname">Ignored</span>' +
+      '<span class="pmeta">' + rules.length + (rules.length === 1 ? ' rule' : ' rules') + '</span>' +
+      '<span class="pissue">' +
+      (conf.counts.ignoredFindings === 1 ? 'one finding is' : 'findings are') +
+      ' being held back</span></span>' +
+      /* The same four cells every other row has. Three of them place wrongly
+         under the narrow-width rules, which reposition `picon` and `pchev`
+         across two rows and expect a fourth child to occupy the gap. */
+      '<span class="pright"><span class="pstatus">' + (conf.counts.ignoredFindings || 0) + '</span></span>' +
+      '<ha-icon class="pchev" icon="mdi:chevron-down"></ha-icon></button>' +
+      (open ? '<div class="ignrules">' + rows.join('') + '</div>' : '') +
+      '</div>'
+    );
+  }
+
   function configSection(model, state) {
     const conf = model.config;
     if (!conf || !conf.ready) return '';
+    const ignored = ignoredHtml(conf, state);
 
     if (!conf.problems.length) {
       return sectionHtml(
-        'Broken configuration', '',
+        'Configuration issues', '',
         '<div class="allgood"><ha-icon icon="mdi:check-circle-outline"></ha-icon>' +
         '<span><strong>Configuration looks healthy</strong>' +
         '<small>Every entity, device, area, script, scene and action referenced by ' +
         conf.counts.scanned.automation + ' automations, ' + conf.counts.scanned.script +
-        ' scripts and ' + conf.counts.scanned.cards + ' dashboard cards still exists.</small></span></div>',
+        ' scripts and ' + conf.counts.scanned.cards + ' dashboard cards still exists.</small></span></div>' +
+        ignored,
         'sec-config'
       );
     }
 
-    const counts = new Map();
-    for (const p of conf.problems) counts.set(p.type, (counts.get(p.type) || 0) + 1);
     const chips = CONFIG_CHIPS
-      .filter((c) => c.id === 'all' || counts.get(c.id))
-      .map((c) => ({ ...c, n: c.id === 'all' ? conf.problems.length : counts.get(c.id) }));
+      .map((c) => ({ ...c, n: conf.problems.filter((p) => configChipMatches(p, c.id)).length }))
+      .filter((c) => c.n > 0);
     const active = chips.some((c) => c.id === state.confChip) ? state.confChip : 'all';
 
     const rows = conf.problems
-      .filter((p) => active === 'all' || p.type === active)
-      .map((p) => configItemHtml(p, state.open.has(p.key)));
+      .filter((p) => configChipMatches(p, active))
+      .map((p) => configItemHtml(p, state.open.has(p.key), state, conf));
 
     return sectionHtml(
-      'Broken configuration',
+      'Configuration issues',
       rows.length + (rows.length === 1 ? ' item' : ' items'),
       (chips.length > 2 ? chipsHtml(chips, active, 'confchip') : '') +
-      '<div class="probs">' + rows.join('') + '</div>',
+      '<div class="probs">' + rows.join('') + '</div>' + ignored,
       'sec-config'
     );
   }
@@ -4363,6 +5410,8 @@ ha-card.sec { padding: 10px 12px 12px; overflow: hidden; }
 .band-warn     { --dh-accent: #e8710a; }
 .band-unknown  { --dh-accent: var(--warning-color, #ffa600); }
 .band-battery  { --dh-accent: #e8710a; }
+/* Impaired sits between broken and warning, and its colour says so. */
+.band-impaired { --dh-accent: #e8710a; }
 .band-ok       { --dh-accent: var(--secondary-text-color); }
 
 /* ---- summary ---- */
@@ -4534,6 +5583,20 @@ ha-card.mini.overall { overflow: hidden; }
   margin-top: 8px; font-size: 0.71rem; color: var(--secondary-text-color); line-height: 1.35;
 }
 .confnote > span { min-width: 0; flex: 1 1 140px; }
+/* The two operational facts sit on the same line as the coverage note when
+   there is room. They are the first thing to go when there is not: the page
+   is about findings, and a scan timestamp is not worth a line of its own on a
+   304px tile. */
+/* Inline, inside the note's own text run, so they reflow with it instead of
+   becoming flex items that force a line of their own. */
+.opswhen, .opsnext { opacity: 0.85; white-space: nowrap; }
+.opswhen::before, .opsnext::before { content: " · "; }
+@container dhcard (max-width: 560px) {
+  .opsnext { display: none; }
+}
+@container dhcard (max-width: 340px) {
+  .opswhen { display: none; }
+}
 .rescan {
   display: inline-flex; align-items: center; gap: 4px; margin-left: auto;
   font: inherit; font-size: 0.71rem; font-weight: 600; cursor: pointer;
@@ -4553,7 +5616,7 @@ ha-card.mini.overall { overflow: hidden; }
 .ploc { font-size: 0.7rem; color: var(--secondary-text-color); line-height: 1.25; }
 .issues { display: grid; gap: 5px; }
 .issue {
-  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 7px;
   padding: 6px 8px; border-radius: 8px;
   background: color-mix(in srgb, var(--dh-accent) 6%, transparent);
 }
@@ -4563,6 +5626,57 @@ ha-card.mini.overall { overflow: hidden; }
 .imsg { font-size: 0.76rem; color: var(--primary-text-color); overflow-wrap: anywhere; }
 .iloc { font-size: 0.69rem; color: var(--secondary-text-color); }
 .ihint { font-size: 0.69rem; color: var(--primary-color, #03a9f4); overflow-wrap: anywhere; }
+
+/* ---- ignore controls ----
+   The arm button is a quiet glyph until the row is hovered or focused, so a
+   page of findings does not read as a page of buttons. The chooser that opens
+   underneath it is a single column: at 304px there is no room for a row of
+   scopes, and a scope picked by accident is exactly what this must not do. */
+.ignbtn {
+  align-self: start; flex: none; cursor: pointer;
+  background: none; border: 0; border-radius: 6px; padding: 2px;
+  color: var(--secondary-text-color); opacity: 0.45; transition: opacity 0.12s;
+}
+.ignbtn ha-icon { --mdc-icon-size: 15px; display: block; }
+.issue:hover .ignbtn, .ignbtn:focus-visible { opacity: 1; }
+.ignwrap {
+  display: grid; gap: 4px; margin-top: 6px; padding-top: 6px;
+  border-top: 1px dashed var(--divider-color);
+}
+.ignq { font-size: 0.69rem; color: var(--secondary-text-color); }
+.ignopt {
+  display: flex; flex-direction: column; gap: 1px; text-align: left; cursor: pointer;
+  padding: 5px 8px; border-radius: 7px; min-height: 34px;
+  border: 1px solid var(--divider-color); background: transparent;
+  color: var(--primary-text-color); font: inherit;
+}
+.ignopt:hover { border-color: var(--dh-accent); background: color-mix(in srgb, var(--dh-accent) 14%, transparent); }
+.ignlabel { font-size: 0.72rem; overflow-wrap: anywhere; }
+.ignhit { font-size: 0.66rem; color: var(--secondary-text-color); }
+.ignopt.wide .ignlabel { font-family: var(--code-font-family, monospace); }
+.ignopt.ignx { align-items: center; color: var(--secondary-text-color); min-height: 30px; }
+.ignopt.is-busy { opacity: 0.5; pointer-events: none; }
+.ignopt.is-failed { border-color: var(--error-color, #db4437); color: var(--error-color, #db4437); }
+.ignsec { margin-top: 10px; border: 1px dashed var(--divider-color); border-radius: 12px; overflow: hidden; }
+.ignsec .probhead { opacity: 0.75; }
+.ignsec.is-open .probhead { opacity: 1; }
+.ignrules { display: grid; gap: 6px; padding: 0 9px 9px; }
+.ignrule {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center;
+  padding: 6px 8px; border-radius: 8px; background: color-mix(in srgb, var(--dh-accent) 5%, transparent);
+}
+.ignrtext { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ignrscope {
+  font-size: 0.62rem; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--secondary-text-color);
+}
+.ignrtext .mono { font-family: var(--code-font-family, monospace); font-size: 0.74rem; overflow-wrap: anywhere; }
+.ignrhits { font-size: 0.68rem; color: var(--secondary-text-color); }
+.ignrsample { font-size: 0.66rem; color: var(--secondary-text-color); opacity: 0.8; overflow-wrap: anywhere; }
+@container dhcard (max-width: 420px) {
+  .ignrule { grid-template-columns: minmax(0, 1fr); }
+  .ignrule .devbtn { justify-self: start; }
+}
 .dmeta {
   display: flex; flex-wrap: wrap; gap: 4px 10px; margin-bottom: 6px;
   font-size: 0.7rem; color: var(--secondary-text-color);
@@ -4753,6 +5867,12 @@ ha-card.mini.overall { overflow: hidden; }
 .integ.band-ok .ival ha-icon { --mdc-icon-size: 15px; }
 
 /* ---- orphans ---- */
+/* The device behind an impaired reference: a link, not a decoration. */
+.idev { display: inline-flex; align-items: baseline; gap: 4px; flex-wrap: wrap; }
+.devlink {
+  border: 0; background: none; padding: 0; font: inherit; font-size: inherit;
+  color: var(--primary-color, #03a9f4); cursor: pointer; text-decoration: underline;
+}
 .orphnote { font-size: 0.7rem; color: var(--secondary-text-color); margin: 0 0 8px; line-height: 1.35; }
 
 /* ---- empty / healthy ---- */
@@ -4829,12 +5949,83 @@ ha-card.mini.overall { overflow: hidden; }
    */
   let configCache = { sig: null, promise: null, model: null };
 
+  /** The entity the backend scan publishes on. */
+  const SCAN_ENTITY = 'pyscript.config_health';
+
+  /* Rules written from this browser that the backend has not republished yet,
+     and rules withdrawn from this browser that it still publishes. Both drain
+     themselves the moment the published list agrees, so a rule saved on the
+     phone and a rule saved here converge without either of them winning. */
+  const pendingIgnores = [];
+  const pendingUnignores = new Set();
+
+  /** The broken references the file scanner published, as the card sees them. */
+  function backendMissing(hass) {
+    const st = hass && hass.states && hass.states[SCAN_ENTITY];
+    const list = st && st.attributes && st.attributes.missing;
+    return Array.isArray(list) ? list : [];
+  }
+
+  function ignoreRulesOf(hass) {
+    const st = hass && hass.states && hass.states[SCAN_ENTITY];
+    const published = (st && st.attributes && st.attributes.ignores) || [];
+    const rules = (Array.isArray(published) ? published : []).filter((r) => {
+      const id = r.id || r.scope + ':' + r.value;
+      if (!pendingUnignores.has(id)) return true;
+      return false;
+    });
+    /* Anything the backend now carries is no longer pending. */
+    for (let i = pendingIgnores.length - 1; i >= 0; i--) {
+      if (rules.some((r) => (r.id || r.scope + ':' + r.value) === pendingIgnores[i].id)) pendingIgnores.splice(i, 1);
+    }
+    for (const id of Array.from(pendingUnignores)) {
+      if (!(Array.isArray(published) ? published : []).some((r) => (r.id || r.scope + ':' + r.value) === id)) {
+        pendingUnignores.delete(id);
+      }
+    }
+    return rules.concat(pendingIgnores);
+  }
+
+  /**
+   * The two passes that turn a scan into what the page shows: join current
+   * state onto the dependency index, then set aside whatever the user has
+   * chosen to ignore. Always in that order - a rule can cover a runtime
+   * finding, so the finding has to exist before it can be hidden.
+   */
+  function joinRuntime(config, hass) {
+    if (!config || !config.items) return config;
+    /* The ignore chooser has to say what a rule would hide, which means asking
+       about labels - so the model keeps the hass it was last joined against. */
+    config.hass = hass;
+    applyRuntime(config, hass, dependencyDeviceIndex(hass));
+    applyIgnores(config, ignoreRulesOf(hass), hass);
+    return config;
+  }
+
   /**
    * Events that mean "something the inspector reads has been rewritten".
    * `lovelace_updated` fires when any dashboard is saved; `automation_reloaded`
    * fires when automations are reloaded, which is what saving one does.
    */
-  const CONFIG_EVENTS = ['lovelace_updated', 'automation_reloaded'];
+  const CONFIG_EVENTS = ['lovelace_updated', 'automation_reloaded', 'scene_reloaded'];
+
+  /**
+   * Events that change what a reference *means* without changing a line of
+   * configuration. Deleting, renaming, disabling or re-enabling an entity, or
+   * an integration registering and withdrawing its actions - after any of
+   * those the fetched configuration is still current and only the existence
+   * index is stale, so these take the cheap path: one round trip for the
+   * registry and a re-judge of what is already in hand.
+   *
+   * `service_registered` / `service_removed` are also how a script reload
+   * announces itself, since Home Assistant registers one action per script and
+   * emits no reload event of its own.
+   */
+  const REGISTRY_EVENTS = ['entity_registry_updated', 'service_registered', 'service_removed'];
+
+  /* Registry events arrive in bursts - reloading an integration can emit
+     dozens - so they are collected for longer than a dashboard save is. */
+  const REGISTRY_DEBOUNCE_MS = 2000;
 
   /** How long after a scan a forced rescan is treated as the same request. */
   const FORCE_COALESCE_MS = 1500;
@@ -4924,7 +6115,7 @@ ha-card.mini.overall { overflow: hidden; }
         cluster: Object.assign({}, DEFAULT_CLUSTER, c.cluster || {}),
         manifests: {},
       };
-      this._state = { chip: 'all', confChip: 'all', conflictChip: 'all', open: new Set() };
+      this._state = { chip: 'all', confChip: 'all', conflictChip: 'all', open: new Set(), ignoring: null };
       this._signature = null;
       /* setConfig can arrive after connectedCallback, so registration happens
          in whichever runs second. */
@@ -4965,6 +6156,7 @@ ha-card.mini.overall { overflow: hidden; }
         for (const card of compactPeers) card._renderCompact(true);
       }
       window.clearTimeout(this._changeTimer);
+      window.clearTimeout(this._registryTimer);
       for (const un of this._unsubs || []) {
         try { un(); } catch (e) { /* the socket may already be gone */ }
       }
@@ -4990,16 +6182,76 @@ ha-card.mini.overall { overflow: hidden; }
       const conn = this._hass && this._hass.connection;
       if (!conn || typeof conn.subscribeEvents !== 'function' || this._unsubs) return;
       this._unsubs = [];
+      const keep = (un) => {
+        /* The card may have been detached while the subscription was in
+           flight, which would otherwise leak it. */
+        if (this._unsubs) this._unsubs.push(un);
+        else un();
+      };
       for (const type of CONFIG_EVENTS) {
         Promise.resolve(conn.subscribeEvents(() => this._configChanged(), type))
-          .then((un) => {
-            /* The card may have been detached while the subscription was in
-               flight, which would otherwise leak it. */
-            if (this._unsubs) this._unsubs.push(un);
-            else un();
-          })
+          .then(keep)
           .catch(() => { /* unknown event type on this version: stay quiet */ });
       }
+      for (const type of REGISTRY_EVENTS) {
+        Promise.resolve(conn.subscribeEvents(() => this._registryChanged(), type))
+          .then(keep)
+          .catch(() => { /* unknown event type on this version: stay quiet */ });
+      }
+    }
+
+    /**
+     * A registry change: re-judge, do not re-fetch.
+     *
+     * The audit found the browser model could sit on a deleted entity until
+     * the page was reopened, because nothing in the state machine changes when
+     * an entity is removed from the registry. Answering it with a full rescan
+     * would mean 132 round trips every time an integration reloads, so the
+     * cached sources are re-inspected against a fresh registry instead.
+     */
+    /**
+     * The backend scan republished: fold its new answer in.
+     *
+     * Its broken-reference list and its dependency universe both go into the
+     * model at scan time, so a rescan that finds one fewer problem has to be
+     * re-merged rather than merely re-drawn. Re-inspecting from the cached
+     * sources is what makes that cheap enough to do on every republish.
+     */
+    _refreshFromBackend() {
+      if (this._config.mode === 'device-compact') return;
+      const previous = configCache.model;
+      if (!previous || !previous.sources || configCache.running) { this._render(); return; }
+      reinspectConfiguration(this._hass, this._config, previous, { refetchDeps: true })
+        .then((m) => {
+          if (!m || configCache.model !== previous) return;
+          configCache.model = m;
+          if (!this._model) return;
+          this._model.config = m;
+          joinRuntime(m, this._hass);
+          this._render();
+        })
+        .catch(() => { this._render(); });
+    }
+
+    _registryChanged() {
+      if (this._config.mode === 'device-compact') return;
+      window.clearTimeout(this._registryTimer);
+      this._registryTimer = window.setTimeout(() => {
+        const previous = configCache.model;
+        if (!previous || !previous.sources || configCache.running) return;
+        reinspectConfiguration(this._hass, this._config, previous)
+          .then((m) => {
+            if (!m) return;
+            /* Only if nothing else has replaced the scan in the meantime. */
+            if (configCache.model !== previous) return;
+            configCache.model = m;
+            if (!this._model) return;
+            this._model.config = m;
+            joinRuntime(m, this._hass);
+            this._render();
+          })
+          .catch(() => { /* a failed re-judge leaves the old model standing */ });
+      }, REGISTRY_DEBOUNCE_MS);
     }
 
     /* One save can raise several events, so the rescan is debounced rather than
@@ -5114,6 +6366,11 @@ ha-card.mini.overall { overflow: hidden; }
       /* Whatever the shared scan has produced so far; null means it is still
          running and the configuration sections say so. */
       model.config = configCache.model;
+      /* The runtime join. Rewritten here rather than during the scan because
+         it answers to state, not to configuration: the scan runs once, this
+         runs whenever an entity a configuration item depends on changes. It
+         costs a lookup per unavailable entity, not a walk of anything. */
+      if (model.config) joinRuntime(model.config, this._hass);
       model.conflicts = configCache.model && configCache.model.conflicts;
       this._model = model;
       this._render();
@@ -5140,6 +6397,7 @@ ha-card.mini.overall { overflow: hidden; }
           this._scanning = false;
           if (!this._model) return;
           this._model.config = m;
+          if (m) joinRuntime(m, this._hass);
           this._model.conflicts = m && m.conflicts;
           this._render();
         });
@@ -5333,6 +6591,70 @@ ha-card.mini.overall { overflow: hidden; }
      * registry subscription once the write lands, which is what re-renders the
      * page - there is nothing to poll and no local copy to keep in step.
      */
+    /**
+     * Write an ignore rule, and show its effect immediately.
+     *
+     * The store is on the Home Assistant side, not in this browser: the same
+     * answer has to hold on every wall tablet, and this install has thirteen
+     * accounts. The backend rescans and republishes after every change, but
+     * that round trip takes a second or two, so the rule is applied locally
+     * first and drops out of `pendingIgnores` as soon as the published list
+     * carries it.
+     */
+    async _ignore(rule, button) {
+      const hass = this._hass;
+      if (!hass) return;
+      if (button) button.classList.add('is-busy');
+      const id = rule.id || rule.scope + ':' + rule.value + ':' + (rule.item || '') + ':' + (rule.kind || '');
+      try {
+        pendingIgnores.push({ ...rule, id });
+        this._state.ignoring = null;
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        this._render();
+        await hass.callWS({
+          type: 'call_service', domain: 'pyscript', service: 'config_health_ignore',
+          service_data: { scope: rule.scope, value: rule.value, item: rule.item || null },
+        });
+      } catch (e) {
+        /* The rule never landed, so it must not keep hiding anything. */
+        const at = pendingIgnores.findIndex((r) => r.id === id);
+        if (at >= 0) pendingIgnores.splice(at, 1);
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        this._render();
+        if (button) {
+          button.classList.remove('is-busy');
+          button.classList.add('is-failed');
+          button.setAttribute('title', 'Could not save the rule: ' + (e && e.message ? e.message : e));
+        }
+      }
+    }
+
+    async _unignore(ruleId, button) {
+      const hass = this._hass;
+      if (!hass || !ruleId) return;
+      if (button) button.classList.add('is-busy');
+      try {
+        pendingUnignores.add(ruleId);
+        const at = pendingIgnores.findIndex((r) => r.id === ruleId);
+        if (at >= 0) pendingIgnores.splice(at, 1);
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        this._render();
+        await hass.callWS({
+          type: 'call_service', domain: 'pyscript', service: 'config_health_unignore',
+          service_data: { rule_id: ruleId },
+        });
+      } catch (e) {
+        pendingUnignores.delete(ruleId);
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        this._render();
+        if (button) {
+          button.classList.remove('is-busy');
+          button.classList.add('is-failed');
+          button.setAttribute('title', 'Could not remove the rule: ' + (e && e.message ? e.message : e));
+        }
+      }
+    }
+
     async _setSkipped(deviceId, on, button) {
       const hass = this._hass;
       if (!hass || !deviceId) return;
@@ -5447,6 +6769,33 @@ ha-card.mini.overall { overflow: hidden; }
           this._render();
           return;
         }
+        const arm = ev.target.closest('[data-ignorearm]');
+        if (arm) {
+          ev.stopPropagation();
+          this._state.ignoring = arm.dataset.ignorearm;
+          this._render();
+          return;
+        }
+        if (ev.target.closest('[data-ignorecancel]')) {
+          ev.stopPropagation();
+          this._state.ignoring = null;
+          this._render();
+          return;
+        }
+        const apply = ev.target.closest('[data-ignoreapply]');
+        if (apply) {
+          ev.stopPropagation();
+          let rule = null;
+          try { rule = JSON.parse(apply.dataset.ignoreapply); } catch (e) { rule = null; }
+          if (rule) this._ignore(rule, apply);
+          return;
+        }
+        const unignore = ev.target.closest('[data-unignore]');
+        if (unignore) {
+          ev.stopPropagation();
+          this._unignore(unignore.dataset.unignore, unignore);
+          return;
+        }
         const toggle = ev.target.closest('[data-toggle]');
         if (toggle) {
           const key = toggle.dataset.toggle;
@@ -5468,6 +6817,9 @@ ha-card.mini.overall { overflow: hidden; }
      exercise the same code that ships, rather than a copy of it. */
   window.DEVICE_HEALTH_INTERNALS = {
     analyse, trackRecoveries, findClusters, durationText, batteryIcon, ageOf,
+    applyRuntime, buildDependencyIndex, dependencyDeviceIndex,
+    mergeFileDeps, mergeFileMissing, applyIgnores, ignorePreview, globToRe, summariseConfig,
+    inspectSources, joinRuntime, ignoreRulesOf,
     HEALTH_SIGNALS, SEVERITY,
     buildIndex, inspectConfiguration, walkRefs, judge, findingsOf,
     analyseConflicts, conflictsCompact, overallCompact, sequenceDuration, durationSeconds, triggerOccurrences,
@@ -5511,13 +6863,6 @@ ha-card.mini.overall { overflow: hidden; }
 (function () {
   "use strict";
   var ENTITY = "pyscript.config_health";
-  var TYPE_KEY = {
-    automation: "brokenAutomations",
-    script: "brokenScripts",
-    scene: "brokenScenes",
-    dashboard: "dashboardProblems"
-  };
-
   function findings(hass) {
     var st = hass && hass.states && hass.states[ENTITY];
     var list = (st && st.attributes && st.attributes.missing) || [];
@@ -5526,49 +6871,30 @@ ha-card.mini.overall { overflow: hidden; }
     return { st: st, list: list, byRef: byRef };
   }
 
+  /**
+   * Links each published finding to the card item that owns it.
+   *
+   * It used to recompute the counters here as well, which made the file
+   * scanner authoritative and quietly discarded anything only the browser had
+   * found. The card now folds the published list into its own model - one
+   * finding per reference per item, whichever scanner saw it - so all this has
+   * to do is give the BROKEN REFERENCES panel a route back to the item.
+   */
   function merge(card) {
     var cfg = card._model && card._model.config;
     if (!cfg || !cfg.counts) return;
     var f = findings(card._hass);
     if (!f.st) return;
-    var counts = cfg.counts;
-    Object.keys(TYPE_KEY).forEach(function (t) { counts[TYPE_KEY[t]] = 0; });
-    counts.other = 0;
-    var verified = 0;
-    var matched = {};
     (cfg.items || []).forEach(function (item) {
-      var hit = false;
       (item.issues || []).forEach(function (iss) {
         var rec = f.byRef[iss.ref];
         if (!rec) return;
-        var occ = (rec.occurrences && rec.occurrences[0]) || {};
-        iss.confidence = "verified";
-        iss.chFile = occ.file;
-        iss.chLine = occ.line;
-        iss.chSuggestion = rec.suggestion;
-        iss.chEditable = rec.editable;
         /* The card already worked out what this item is and how to open it.
            Keeping the link means the panel never has to re-derive a route
            from a file path and a line number. */
-        rec.chItem = item;
-        matched[iss.ref] = true;
-        hit = true;
-        verified += 1;
+        if (!rec.chItem) rec.chItem = item;
       });
-      if (hit) {
-        item.band = "broken";
-        var key = TYPE_KEY[item.type];
-        if (key) counts[key] += 1;
-      }
     });
-    counts.other = f.list.filter(function (m) { return !matched[m.entity_id]; }).length;
-    counts.verifiedIssues = verified;
-    counts.missingEntities = f.list.length;
-    counts.brokenTotal = counts.brokenAutomations + counts.brokenScripts +
-      counts.brokenScenes + counts.dashboardProblems + counts.other;
-    counts.brokenItems = counts.brokenTotal;
-    counts.unvalidated = Math.max(0, (counts.unvalidated || 0) - verified);
-    cfg.healthy = counts.brokenTotal === 0;
   }
 
   function esc(s) {
@@ -5800,7 +7126,13 @@ ha-card.mini.overall { overflow: hidden; }
         /* Not on the first sighting: the card is about to render anyway, and
            rendering before it has a model throws. */
         if (prev === undefined || !this._model) return;
-        try { this._render(); } catch (e) { console.warn("[config-health]", e); }
+        try {
+          /* A republished scan is new data, not just a repaint: its broken
+             references and its dependency edges both have to be folded back
+             into the model before anything is drawn. */
+          if (typeof this._refreshFromBackend === "function") this._refreshFromBackend();
+          else this._render();
+        } catch (e) { console.warn("[config-health]", e); }
       };
       patchedSet.__chPatched = true;
       Object.defineProperty(proto, "hass", {

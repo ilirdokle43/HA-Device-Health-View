@@ -14,6 +14,7 @@ the two and reports both.
 |---|---|---|
 | **Runtime health** | is anything unhealthy *right now*? | `sensor.outdoor_temperature` exists but reads `unavailable` — a device problem |
 | **Configuration health** | does everything the configuration *points at* still exist? | an automation names `sensor.old_outdoor_temperature`, which was deleted — a configuration problem |
+| **The join between them** | is anything *structurally fine but unable to run today*? | an automation whose sensor exists but has been silent for four hours — **impaired**, not broken |
 
 A device card never becomes a broken-automation card, and neither counter ever counts the
 other's findings.
@@ -23,10 +24,11 @@ registries, `automation/config`, `script/config`, the scene editor endpoint, `lo
 `lovelace/resources` and `get_services`. No third-party integration is required for any of it,
 and the card never writes to your configuration on its own.
 
-One optional extra goes further: a [pyscript backend](#broken-references-optional-backend) that
-finds dead references inside UI-created helpers, which the API does not expose. That part *can*
-repair a reference, but only when you press the button, and it never rewrites a `.storage` file
-Home Assistant owns.
+One optional extra goes further: a [pyscript backend](#the-backend-optional) that reads what
+the frontend cannot — YAML packages, `templates.yaml`, and the helper configuration buried in
+`.storage` — and turns the whole thing into health entities, a report file and a notification
+when something new breaks. That part *can* repair a reference, but only when you press the
+button, and it never rewrites a `.storage` file Home Assistant owns.
 
 ## Features
 
@@ -38,9 +40,15 @@ Home Assistant owns.
 - **Broken references, found statically.** Automations, scripts, scenes and every Lovelace
   dashboard are walked structurally for references to entities, devices, areas, floors, labels,
   scripts, scenes, helpers, buttons and actions that no longer exist.
-- **Conservative by design.** Every finding is `verified`, `warning` or `unvalidated`, and only
-  verified findings reach the red counters. A template it cannot resolve is reported as
+- **Conservative by design.** Every finding is `broken`, `impaired`, `warning` or `unvalidated`,
+  and only broken findings reach the red counters. A template it cannot resolve is reported as
   unresolvable, never as broken.
+- **Impaired, not broken.** A configuration whose references all exist but one of which is
+  `unavailable` or `unknown` right now cannot do its job today. It gets its own tier, its own
+  colour, and the name of the device responsible.
+- **Ignore what you have already decided about.** Six scopes — one reference, a glob, one
+  configuration item, one kind of finding, that kind on that item, or anything carrying a
+  label — each showing how many findings it would hide *before* you commit to it.
 - **Two alert tiles** for a main dashboard that show nothing at all when nothing is wrong.
 - **Probable shared causes.** When several devices on one integration fail within minutes of
   each other, it says so — and distinguishes that from a Home Assistant restart.
@@ -158,18 +166,20 @@ That also gives you two other ways in, for a device that is currently healthy an
 card to press Skip on: add the label by hand in Settings, or name the device in
 `exclude_devices`.
 
-## Broken references (optional backend)
+## The backend (optional)
 
-The inspector above reads what Home Assistant will serve over its API. That leaves one
-blind spot: **template helpers created in the UI**, whose configuration lives inside
-`.storage/core.config_entries` and is not exposed to the frontend. A helper averaging a
-sensor you deleted last year looks perfectly healthy from the outside and quietly returns
-`unknown`.
+The inspector above reads what Home Assistant will serve over its API. That leaves a blind
+spot roughly a third of the configuration wide: **YAML packages and included files**, and
+**helpers created in the UI**, whose configuration lives inside `.storage/core.config_entries`
+and is never exposed to the frontend. A helper averaging a sensor you deleted last year looks
+perfectly healthy from the outside and quietly returns `unknown`.
 
 An optional pyscript backend closes that gap. It walks the configuration files and the
 relevant `.storage` entries, publishes what it finds on `pyscript.config_health`, and the
 card grows a **BROKEN REFERENCES** panel listing each dead reference with the helper that
-owns it.
+owns it. It also hands the card every reference that *resolves*, so a dependency the browser
+cannot see still takes part in the impaired join — and it publishes health entities, writes a
+report file and sends a notification when something new appears.
 
 ### Installing it
 
@@ -186,8 +196,86 @@ errors, and no counter changes.
 
 | Service | What it does |
 |---|---|
-| `pyscript.config_health_rescan` | Re-runs the scan and republishes the entity. Also runs at startup and daily at 04:17. |
+| `pyscript.config_health_rescan` | Re-runs the scan and republishes everything. Answers with a summary (`status`, `broken`, `impaired`, `warnings`, `ignored`, `generated`) so an automation can act on the result without reading an entity back. Also runs at startup and daily at 04:17. |
+| `pyscript.config_health_deps` | Returns the full dependency universe — every reference that resolves, with the file, line and owner that names it. Response-only, because it is far too large for a state attribute. |
 | `pyscript.config_health_fix` | Replaces one missing reference with an existing entity. |
+| `pyscript.config_health_ignore` | Accepts a finding so it stops being reported. `scope` is one of `ref`, `pattern`, `item`, `kind`, `label`. |
+| `pyscript.config_health_unignore` | Withdraws one rule by `rule_id`, or all of them with `all_rules: true`. |
+
+### Health entities
+
+The backend publishes six entities over MQTT discovery, grouped under one service device
+called **Home Assistant Health**. They are ordinary registry entities: they appear in entity
+pickers, work in automations and templates, and survive a restart.
+
+| Entity | State | Attributes |
+|---|---|---|
+| `sensor.config_health_status` | `healthy` · `warning` · `impaired` · `broken` · `error` | last successful scan, next scheduled scan, files scanned, dependencies tracked, scan duration, error |
+| `sensor.config_health_broken` | count of broken **items** | a breakdown per owner type, and the number of distinct references |
+| `sensor.config_health_impaired` | count of impaired items | the same shape |
+| `sensor.config_health_warnings` | count of warnings | — |
+| `sensor.config_health_last_scan` | timestamp | — |
+| `button.config_health_rescan` | — | presses run the same scan the card's Rescan button does |
+
+Requires the MQTT integration. Without a broker the card and the panel work exactly as
+before; the entities simply never appear.
+
+A failed scan publishes `status: error` and **keeps the previous counts**. It never reports
+zero problems because it could not read the configuration, and it never notifies.
+
+### Notifications
+
+After a *scheduled* scan — never after one you asked for by hand — the backend compares the
+current actionable findings against what it has already told you about, and pushes only what
+is new:
+
+- a **broken** finding notifies as soon as a background scan sees it;
+- an **impaired** finding has to have been continuously impaired for five minutes first,
+  because a device blinking out for three seconds is not news;
+- a finding already notified never notifies again;
+- a finding that clears is forgotten, so if it comes back it counts as a new incident;
+- warnings, ignored and unvalidated findings never notify at all;
+- ten new findings are one message, not ten.
+
+Nothing is pushed for ten minutes after a restart, so a house coming back up is not reported
+as a house full of new problems.
+
+To switch it on, create `config/config_health_options.json`:
+
+```json
+{
+  "notify_service": "mobile_app_my_phone",
+  "notify_url": "/lovelace/health"
+}
+```
+
+`notify_service` is the part after `notify.` in **Developer tools → Actions**; `notify_url`
+is where tapping the notification should land. Leave the file out and notifications stay
+off — everything else still works. Incident state lives in
+`config/config_health_notification_state.json`, which is small and readable.
+
+### Report file
+
+Every completed scan rewrites `config/config_health_report.txt`:
+
+```text
+HOME ASSISTANT CONFIGURATION HEALTH
+
+Generated: 2026-08-28 04:17
+Status: HEALTHY
+
+BROKEN:   0
+IMPAIRED: 0
+WARNINGS: 0
+IGNORED:  0
+...
+```
+
+When something is wrong it names the owner, the reference, the problem, where it was found,
+and — for impaired findings — how long it has been that way. Ignored findings are listed
+apart from the actionable ones. It contains entity ids, friendly names and file positions;
+`secrets.yaml` is never scanned and the keys that could carry a URL or a token are dropped
+before a reference is ever recorded.
 
 ### What it will and will not rewrite
 
@@ -250,8 +338,9 @@ field documentation is never mistaken for a call. Every finding carries a confid
 
 | | Meaning | Counted as broken? |
 |---|---|---|
-| **verified** 🔴 | static reference, in a slot that can only hold that kind of object, and the object is in none of the registries | yes |
-| **warning** 🟠 | a legitimate explanation exists — the object is disabled, its integration is not loaded, or the reference sits in a block that is switched off | no |
+| **broken** 🔴 | static reference, in a slot that can only hold that kind of object, and the object is in none of the registries | yes |
+| **impaired** 🟠 | every reference exists, but one of them is `unavailable` or `unknown` right now, so the item cannot do its job today | no — its own counter |
+| **warning** 🟡 | a legitimate explanation exists — the object is disabled, its integration is not loaded, or the reference sits in a block that is switched off | no |
 | **unvalidated** ⚪ | the slot holds a template or a runtime variable | never |
 
 An item whose *only* findings are unvalidated never appears on the page at all.
@@ -259,8 +348,40 @@ An item whose *only* findings are unvalidated never appears on the page at all.
 What is checked: entities (naming the domain — "Missing button", "Missing helper", "Missing
 script"), devices and entity-registry ids inside device automations, areas, floors, labels,
 actions/services, static entity references inside `states()` / `is_state()` / `state_attr()`
-templates, Lovelace cards and badges at any nesting depth, custom card registration, and
-duplicate Lovelace resource registrations.
+templates, top-level `variables` and `trigger_variables`, a script's `fields.default`,
+Lovelace cards and badges at any nesting depth, a custom card's own option names, custom card
+registration, and duplicate Lovelace resource registrations.
+
+### One dependency universe
+
+A reference that *resolves* is not a finding, but it is a dependency: if that entity later
+goes quiet, the thing naming it stops working while remaining perfectly valid. Both halves
+of the scanner record those edges into one index — the browser for what it can read over the
+API, the backend for what it cannot: YAML packages, `templates.yaml`, `sensors.yaml` and
+every helper's config entry. A reference both halves see is one dependency with two
+witnesses, never two rows saying the same thing.
+
+The runtime join then walks only the entities that are not answering. One classification is
+used by both halves, and its precedence is fixed:
+
+```text
+missing      in neither the state machine nor the registry   -> BROKEN
+disabled     in the registry, disabled_by set                -> WARNING
+unavailable  exists, enabled, state is "unavailable"         -> IMPAIRED
+unknown      exists, enabled, state is "unknown"             -> IMPAIRED
+anything else                                                -> healthy
+```
+
+`off`, `closed`, `idle`, `standby` and `not_home` are a working entity doing its job.
+
+### Ignoring a finding
+
+The eye-off button on any counted finding offers the scopes that apply to it, each with the
+number of findings it would hide. Rules live in `config/config_health_ignores.json` — on the
+Home Assistant side, not in one browser, because the same answer has to hold on every tablet
+and survive a restart. An **Ignored** panel lists every rule with what it is hiding and a
+**Show again** button. Ignored findings never reach a counter, the compact tiles or a
+notification.
 
 Two rules matter more than the rest:
 
@@ -284,9 +405,14 @@ every card on the page. It repeats when — and only when — something it read 
 | an automation, script or scene added or deleted | the scan signature is the set of those entity ids |
 | a dashboard saved | `lovelace_updated` on the event bus |
 | an automation saved or reloaded | `automation_reloaded` on the event bus |
-| anything else | the **Rescan** button |
+| a scene reloaded | `scene_reloaded` on the event bus |
+| an entity renamed, deleted, disabled or re-enabled | `entity_registry_updated` — answered by re-judging the configuration already in hand against a fresh registry, one round trip rather than hundreds |
+| an action registered or withdrawn | `service_registered` / `service_removed` |
+| the backend republished a scan | the scan entity's own timestamp |
+| anything else | the **Rescan** button, or `button.config_health_rescan` |
 
-None of it polls.
+None of it polls. The backend adds a five-minute runtime pass that re-evaluates state against
+the dependency index it already holds — no file reading — and a nightly scan at 04:17.
 
 ## Layout
 
@@ -317,8 +443,11 @@ two green "all good" lines and the integration grid.
 - **Automations and scripts that are not loaded cannot be inspected.** Home Assistant only serves
   the configuration of an entity that exists, so an automation that failed to set up is reported
   as "failed to load" rather than having its references checked.
-- **Editing an automation's contents is invisible** until you press Rescan — nothing in the
-  frontend's state changes when a config is rewritten in place.
+- **Editing an automation's contents is invisible** until it is reloaded or you press Rescan —
+  nothing in the frontend's state changes when a config is rewritten in place.
+- **A template sitting in a reference slot is not resolved.** `entity_id: "{{ states('sensor.x')
+  }}"` is reported as unresolvable rather than having `sensor.x` checked. A template in any
+  other position *is* read for the references it names.
 - **Adding or removing a Lovelace resource needs a browser reload**, which is Home Assistant's
   constraint rather than this card's: a custom element cannot be un-defined in a running page.
 - **Recovery tracking has no backend.** The recovered and deleted lists are a diff against a
@@ -327,6 +456,10 @@ two green "all good" lines and the integration grid.
   catches few.
 - **Dynamic references are never validated.** `states('sensor.' ~ variable)` is reported as
   unresolvable, and no attempt is made to guess.
+- **Deleting an area, floor, label or device does not invalidate the page by itself.** Only the
+  entity registry is watched; the rest is picked up by the next scan.
+- **The health entities need MQTT.** Without a broker the card, the panel, the report and the
+  notifications all still work; only the six entities and the Rescan button are absent.
 
 ## Licence
 

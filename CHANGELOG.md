@@ -4,6 +4,81 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.28
+
+The two halves of the scanner now share one dependency universe, and the whole thing grew an
+operational layer: health entities, a Rescan button, notifications and a report file.
+
+### Added
+
+- **Health entities.** Six registry entities over MQTT discovery, grouped under one service
+  device called **Home Assistant Health**: `sensor.config_health_status` (`healthy` ·
+  `warning` · `impaired` · `broken` · `error`), `sensor.config_health_broken`,
+  `sensor.config_health_impaired`, `sensor.config_health_warnings`,
+  `sensor.config_health_last_scan` and `button.config_health_rescan`. They appear in entity
+  pickers, work in automations and templates, and survive a restart. Without a broker they
+  simply do not appear and nothing else changes.
+- **Notifications for genuinely new problems.** After a scheduled scan the backend compares
+  the current actionable findings against what it has already told you about, fingerprinted by
+  kind, reference and owner, and pushes only what is new. Broken findings notify at once;
+  impaired findings must have been continuously impaired for five minutes first, because a
+  device blinking out for three seconds is not news. A finding that clears is forgotten, so
+  its return counts as a new incident. Ten new findings are one message. Warnings, ignored and
+  unvalidated findings never notify, a scan you ask for by hand never notifies, and nothing is
+  sent for ten minutes after a restart.
+- **A report file** at `config/config_health_report.txt`, rewritten after every completed
+  scan, naming the owner, the reference, the problem, its location and — for impaired
+  findings — how long it has been that way.
+- **`config/config_health_options.json`** for the two settings that are specific to one house:
+  the notify action and where a tap should land.
+- **The Ignore UI.** The eye-off button on any counted finding offers the scopes that apply,
+  each showing how many findings it would hide before you commit. An **Ignored** panel lists
+  every rule with what it is hiding and a **Show again** button.
+- **`pyscript.config_health_deps`** returns the full dependency universe; `config_health_rescan`
+  now answers with a summary an automation can act on.
+- **Top-level `variables` and `trigger_variables`** on automations and scripts are walked, as
+  is a script's `fields.default`. Its `description`, `example` and `selector` are documentation
+  for the run dialog and are still left alone.
+- **A custom card's own option names** are recognised by the shape of their value, so
+  `rain_sensor: binary_sensor.rain` becomes a dependency. A guess that does not resolve is
+  reported as unvalidated, never as broken.
+
+### Changed
+
+- **One dependency universe.** The backend now hands the card every reference that *resolves*,
+  with the file, line and owner that names it, so a dependency in a YAML package,
+  `templates.yaml`, `sensors.yaml` or a helper's config entry takes part in the impaired join.
+  A reference both halves of the scanner see is one dependency with two witnesses, not two
+  rows saying the same thing.
+- **One classification, used by both halves**, with fixed precedence: missing beats disabled
+  beats unavailable beats unknown, and everything else is a working entity doing its job.
+  A disabled reference is a warning; it was previously reported by only one half.
+- **Ignore rules are actually applied.** They were stored and republished but never consulted.
+  All six scopes now hold across the page, the counters, the compact tiles, the health
+  entities and notifications.
+- **The compact tiles honour impaired.** Either tile appears for broken *or* impaired work,
+  distinguished by colour; warnings and ignored findings never raise one on their own.
+- The page footer says when the last scan ran and when the next one is due, dropping the
+  schedule below 560px and the timestamp below 340px so it costs no height on a narrow card.
+- The published broken-reference list is folded into the card's own model rather than
+  overwriting its counters, so a finding only the browser can see is no longer discarded.
+
+### Fixed
+
+- **Prose is no longer mistaken for configuration.** `description`, `example`, `url`, `note`,
+  `comment`, `event_type`, `logger`, `unique_id` and `webhook_id` are dropped by both halves of
+  the scanner, including a folded description that runs over several lines. An automation whose
+  description deliberately names a deleted sensor — to say which one *not* to use — was being
+  reported as broken.
+- **Renaming, deleting or disabling an entity now updates the page.** `entity_registry_updated`,
+  `service_registered` and `service_removed` re-judge the configuration already in hand against
+  a fresh registry: one round trip and about fifteen milliseconds, rather than the hundreds a
+  full rescan costs. `scene_reloaded` triggers a full rescan alongside the existing events.
+- A failed scan publishes `status: error` and keeps the previous counts. It no longer reports
+  zero problems because it could not read the configuration, and it never notifies.
+- The field path on a helper's finding read `.options.state` rather than `options.state`.
+- The house tile no longer appears for configuration warnings alone.
+
 ## 2026.8.25.4
 
 ### Fixed
