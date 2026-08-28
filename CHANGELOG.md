@@ -4,6 +4,22 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.28.2
+
+### Fixed
+
+- **A stem is not a broken reference.** Custom cards routinely take a *prefix* and build the
+  real entity id from it - a button-card template doing
+  `entity: [[[ return variables.batt_sensor + '_battery' ]]]` turns
+  `batt_sensor: sensor.tab_hall` into `sensor.tab_hall_battery`. The value written in the
+  configuration is not an entity and never was, but the card-option rule flagged every one of
+  them, putting a row per tablet on a real dashboard: nine findings, eight of them wrong.
+  A weak card-option reference that is the strict prefix of an entity that *does* exist is now
+  left alone entirely. A deleted entity being the prefix of a living one is vanishingly rare;
+  a stem being one is the whole point of a stem, and that asymmetry is what makes the rule
+  safe. Anything that is nobody's stem is still reported - as unvalidated, never as broken -
+  which is how the one genuine typo in that set survived the change.
+
 ## 2026.8.28.1
 
 ### Fixed

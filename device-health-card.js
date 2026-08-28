@@ -1083,6 +1083,27 @@
       hasLabels: !!(hass.labels && Object.keys(hass.labels).length),
       floor: (id) => !!(hass.floors && hass.floors[id]),
       label: (id) => !!(hass.labels && hass.labels[id]),
+      /**
+       * Is this the stem of an entity that exists?
+       *
+       * Custom cards routinely take a *prefix* and build the real id from it.
+       * A button-card template doing
+       * `entity: [[[ return variables.batt_sensor + '_battery' ]]]` turns
+       * `batt_sensor: sensor.tab_hall` into `sensor.tab_hall_battery`, so the
+       * value in the configuration is not an entity and never was. Flagging it
+       * put one row per tablet on a real dashboard, all of them wrong.
+       *
+       * A deleted entity being a strict prefix of a living one is vanishingly
+       * rare; a stem being one is the whole point of a stem. That asymmetry is
+       * what makes this safe.
+       */
+      isStemOf(id) {
+        const prefix = id + '_';
+        for (const key in states) if (key.startsWith(prefix)) return true;
+        for (const key in display) if (key.startsWith(prefix)) return true;
+        for (const key of registered) if (key.startsWith(prefix)) return true;
+        return false;
+      },
       /** Entity-registry entry id, as device triggers store it. */
       registryEntry: (id) => registryIds.get(id) || null,
       knownRegistryIds: registryIds.size > 0,
@@ -1425,8 +1446,13 @@
         message: 'Referenced ' + noun + ' is disabled: ' + value,
       };
     }
-    /* A guess that turned out to point at nothing is a guess, not a break. */
-    if (ref.weak) return weakUnvalidated(ref, value, 'missing');
+    /* A guess that turned out to point at nothing is a guess, not a break -
+       and if it is the stem of an entity that does exist, it was never meant to
+       be an entity id at all, so it is not even worth mentioning. */
+    if (ref.weak) {
+      if (index.isStemOf && index.isStemOf(value)) return null;
+      return weakUnvalidated(ref, value, 'missing');
+    }
     return {
       confidence: index.hasRegistry ? 'verified' : 'warning',
       kind: 'entity', ref: value, location: ref.location,
