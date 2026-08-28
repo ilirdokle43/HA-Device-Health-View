@@ -4,6 +4,25 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.28.1
+
+### Fixed
+
+- **A button nobody has pressed is not impaired.** A `button` entity's state is the timestamp
+  of its last press, so one not pressed since Home Assistant started reads `unknown` forever -
+  200 of 220 buttons on the install this was found on. The impaired join treated every one of
+  them as a dependency in trouble, so a dashboard referencing a button was reported as impaired
+  while working perfectly. `unknown` no longer creates an impaired finding for the command
+  surfaces whose resting state it is - buttons, scenes, events, notify targets, images, TTS and
+  the rest of the list already excluded from device health for the same reason. **`unavailable`
+  still does**: a button that has gone unavailable means the hardware has left the network, and
+  that is worth knowing. The card and the backend share the rule, so the page, the sensors and
+  the notifications agree.
+- **Reworded the impaired message.** "Referenced entity is unknown" read as "I do not recognise
+  this entity", which is the one thing it never meant - a reference to something that genuinely
+  does not exist is reported as missing, in red, before that check ever runs. It now says
+  **"Referenced entity has never reported a value"**.
+
 ## 2026.8.28
 
 The two halves of the scanner now share one dependency universe, and the whole thing grew an

@@ -601,7 +601,7 @@ def _missing_owners(rec):
 PROBLEM_WORD = {
     "entity": "Missing entity",
     "entity-unavailable": "Referenced entity is unavailable",
-    "entity-unknown": "Referenced entity is unknown",
+    "entity-unknown": "Referenced entity has never reported a value",
     "entity-disabled": "Referenced entity is disabled",
 }
 

@@ -663,6 +663,22 @@ def entry_entities(entry_ids):
 # are a working entity doing its job.
 IMPAIRED_STATES = {"unavailable": "entity-unavailable", "unknown": "entity-unknown"}
 
+# Domains for which `unknown` is the resting state rather than a fault. A
+# button's state is the timestamp of its last press, a scene's the last time it
+# was applied; one not fired since Home Assistant started reads `unknown`
+# forever. The card excludes the same domains from device health for exactly
+# this reason, and the two halves have to agree or the page and the phone would
+# disagree about the same entity.
+#
+# `unavailable` is deliberately not excluded: a button that has gone
+# unavailable means the hardware has left the network, and that is news.
+UNKNOWN_IS_IDLE_DOMAINS = {
+    "button", "input_button", "event", "notify", "image", "scene",
+    "conversation", "tts", "stt", "wake_word", "ai_task", "todo", "update",
+    "person", "device_tracker", "siren", "remote", "infrared",
+    "radio_frequency", "media_player",
+}
+
 SEVERITY_OF_KIND = {
     "entity": "broken",
     "device": "broken",
@@ -685,6 +701,8 @@ def classify(entity_id, state, in_registry, disabled):
         return "entity-disabled", "warning"
     kind = IMPAIRED_STATES.get(state)
     if kind:
+        if state == "unknown" and entity_id.split(".", 1)[0] in UNKNOWN_IS_IDLE_DOMAINS:
+            return None, None
         return kind, "impaired"
     return None, None
 

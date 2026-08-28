@@ -2009,6 +2009,30 @@
   const IMPAIRED_STATES = { unavailable: 'entity-unavailable', unknown: 'entity-unknown' };
 
   /**
+   * Domains for which `unknown` is the resting state, not a fault.
+   *
+   * A `button`'s state is the timestamp of its last press, a `scene`'s the last
+   * time it was applied, an `event`'s the last event. One that has not been
+   * fired since Home Assistant started has no timestamp and reads `unknown`
+   * forever. On a normal install that is most of them - 200 of 220 buttons on
+   * the house this was found in - so treating it as an impairment fills the
+   * page with configuration that is working perfectly.
+   *
+   * The same list already excludes these domains from device health for exactly
+   * this reason. `unavailable` is deliberately NOT excluded: a button that has
+   * gone unavailable means the hardware has left the network, and that is news.
+   */
+  const UNKNOWN_IS_IDLE = new Set(DEFAULT_IGNORED_DOMAINS.concat(['input_button']));
+
+  /* "unknown" reads as "I do not recognise this entity", which is the one thing
+     it does not mean - a reference to something that truly does not exist is
+     reported as missing, in red, before this ever runs. */
+  const IMPAIRED_WORD = {
+    'entity-unavailable': 'Referenced entity is unavailable: ',
+    'entity-unknown': 'Referenced entity has never reported a value: ',
+  };
+
+  /**
    * entity_id -> {name, deviceId} for naming the device behind an impaired
    * reference. Cached on the registry objects themselves: they are replaced
    * wholesale when anything in the registry changes, so identity is a free and
@@ -2286,9 +2310,12 @@
         kind = 'entity-disabled';
         message = 'Referenced entity is disabled: ' + entityId;
       } else if (st && IMPAIRED_STATES[st.state]) {
+        /* A command surface that has never been fired is not impaired; it is
+           waiting, which is what it does. */
+        if (st.state === UNKNOWN && UNKNOWN_IS_IDLE.has(domainOf(entityId))) continue;
         confidence = 'impaired';
         kind = IMPAIRED_STATES[st.state];
-        message = 'Referenced entity is ' + st.state + ': ' + entityId;
+        message = IMPAIRED_WORD[kind] + entityId;
       }
       if (!confidence) continue;
       const since = st ? st.last_changed || null : null;
