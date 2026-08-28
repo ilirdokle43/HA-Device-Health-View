@@ -369,6 +369,10 @@ DEFAULT_OPTIONS = {
     "notify_service": None,
     "notify_url": "/lovelace/0",
     "impaired_stable_seconds": IMPAIRED_STABLE_SECONDS,
+    # The device-registry label that means "leave this one alone". The card
+    # writes it from its Skip button; this is only here so an install that
+    # renamed it stays consistent across both halves.
+    "skip_label": "skip_health_checks",
 }
 
 

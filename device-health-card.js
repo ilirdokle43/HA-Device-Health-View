@@ -366,12 +366,7 @@
     const excludes = toRegex(cfg.exclude);
     /* Devices the user has told the card to leave alone, by label or by a
        static id in the card's own YAML. */
-    const skipLabel = cfg.skip_label;
-    const skippedIds = new Set(cfg.exclude_devices || []);
-    for (const id in devices) {
-      const labels = devices[id].labels;
-      if (labels && labels.indexOf(skipLabel) >= 0) skippedIds.add(id);
-    }
+    const skippedIds = skippedDevices(hass, cfg);
 
     /* ---- pass 1: bucket every usable entity onto its device ---------- */
     const byDevice = new Map();
@@ -2035,6 +2030,26 @@
   const IMPAIRED_STATES = { unavailable: 'entity-unavailable', unknown: 'entity-unknown' };
 
   /**
+   * The devices the user has told the card to leave alone.
+   *
+   * Extracted so the configuration half can ask the same question the device
+   * half already asks. Skip has to mean skipped everywhere: a 3D printer that
+   * travels between two houses is switched off in one of them by definition,
+   * and a page that honours that on the device list while still reporting
+   * seven impaired dashboard cards has not really skipped anything.
+   */
+  function skippedDevices(hass, cfg) {
+    const devices = (hass && hass.devices) || {};
+    const label = (cfg && cfg.skip_label) || DEFAULT_SKIP_LABEL;
+    const out = new Set((cfg && cfg.exclude_devices) || []);
+    for (const id in devices) {
+      const labels = devices[id].labels;
+      if (labels && labels.indexOf(label) >= 0) out.add(id);
+    }
+    return out;
+  }
+
+  /**
    * Domains for which `unknown` is the resting state, not a fault.
    *
    * A `button`'s state is the timestamp of its last press, a `scene`'s the last
@@ -2297,8 +2312,13 @@
    * every previously injected finding is dropped first, and the surviving
    * findings are the ones the scan itself produced.
    */
-  function applyRuntime(config, hass, deviceIndex) {
+  function applyRuntime(config, hass, deviceIndex, cfg) {
     if (!config || !config.items) return config;
+    /* Skip is a device-registry label, and it has to mean the same thing here
+       as it does on the device list. Only the runtime verdicts are suppressed:
+       a reference to an entity that has actually been deleted is a broken
+       configuration whether or not the device is skipped. */
+    const skipped = skippedDevices(hass, cfg);
     if (!config.depIndex) config.depIndex = buildDependencyIndex(config.items);
 
     const touched = new Set();
@@ -2349,6 +2369,7 @@
          automation cannot run" to "because that device is offline" without
          holding both halves of the page in their head. */
       const dev = deviceIndex ? deviceIndex.get(entityId) : null;
+      if (confidence !== 'verified' && dev && skipped.has(dev.deviceId)) continue;
       for (const item of items) {
         item.issues.push({
           confidence,
@@ -6045,12 +6066,12 @@ ha-card.mini.overall { overflow: hidden; }
    * chosen to ignore. Always in that order - a rule can cover a runtime
    * finding, so the finding has to exist before it can be hidden.
    */
-  function joinRuntime(config, hass) {
+  function joinRuntime(config, hass, cfg) {
     if (!config || !config.items) return config;
     /* The ignore chooser has to say what a rule would hide, which means asking
        about labels - so the model keeps the hass it was last joined against. */
     config.hass = hass;
-    applyRuntime(config, hass, dependencyDeviceIndex(hass));
+    applyRuntime(config, hass, dependencyDeviceIndex(hass), cfg);
     applyIgnores(config, ignoreRulesOf(hass), hass);
     return config;
   }
@@ -6280,7 +6301,7 @@ ha-card.mini.overall { overflow: hidden; }
           configCache.model = m;
           if (!this._model) return;
           this._model.config = m;
-          joinRuntime(m, this._hass);
+          joinRuntime(m, this._hass, this._config);
           this._render();
         })
         .catch(() => { this._render(); });
@@ -6300,7 +6321,7 @@ ha-card.mini.overall { overflow: hidden; }
             configCache.model = m;
             if (!this._model) return;
             this._model.config = m;
-            joinRuntime(m, this._hass);
+            joinRuntime(m, this._hass, this._config);
             this._render();
           })
           .catch(() => { /* a failed re-judge leaves the old model standing */ });
@@ -6423,7 +6444,7 @@ ha-card.mini.overall { overflow: hidden; }
          it answers to state, not to configuration: the scan runs once, this
          runs whenever an entity a configuration item depends on changes. It
          costs a lookup per unavailable entity, not a walk of anything. */
-      if (model.config) joinRuntime(model.config, this._hass);
+      if (model.config) joinRuntime(model.config, this._hass, this._config);
       model.conflicts = configCache.model && configCache.model.conflicts;
       this._model = model;
       this._render();
@@ -6450,7 +6471,7 @@ ha-card.mini.overall { overflow: hidden; }
           this._scanning = false;
           if (!this._model) return;
           this._model.config = m;
-          if (m) joinRuntime(m, this._hass);
+          if (m) joinRuntime(m, this._hass, this._config);
           this._model.conflicts = m && m.conflicts;
           this._render();
         });
@@ -6662,7 +6683,7 @@ ha-card.mini.overall { overflow: hidden; }
       try {
         pendingIgnores.push({ ...rule, id });
         this._state.ignoring = null;
-        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass, this._config);
         this._render();
         await hass.callWS({
           type: 'call_service', domain: 'pyscript', service: 'config_health_ignore',
@@ -6672,7 +6693,7 @@ ha-card.mini.overall { overflow: hidden; }
         /* The rule never landed, so it must not keep hiding anything. */
         const at = pendingIgnores.findIndex((r) => r.id === id);
         if (at >= 0) pendingIgnores.splice(at, 1);
-        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass, this._config);
         this._render();
         if (button) {
           button.classList.remove('is-busy');
@@ -6690,7 +6711,7 @@ ha-card.mini.overall { overflow: hidden; }
         pendingUnignores.add(ruleId);
         const at = pendingIgnores.findIndex((r) => r.id === ruleId);
         if (at >= 0) pendingIgnores.splice(at, 1);
-        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass, this._config);
         this._render();
         await hass.callWS({
           type: 'call_service', domain: 'pyscript', service: 'config_health_unignore',
@@ -6698,7 +6719,7 @@ ha-card.mini.overall { overflow: hidden; }
         });
       } catch (e) {
         pendingUnignores.delete(ruleId);
-        if (this._model && this._model.config) joinRuntime(this._model.config, hass);
+        if (this._model && this._model.config) joinRuntime(this._model.config, hass, this._config);
         this._render();
         if (button) {
           button.classList.remove('is-busy');

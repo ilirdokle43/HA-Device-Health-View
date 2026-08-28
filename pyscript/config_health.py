@@ -413,7 +413,8 @@ def _run_scan(manual):
 
     deps = _DEPS.get("deps") or []
     ignores = task.executor(ha_config_scan.load_ignores)
-    findings, hidden = _findings(deps, items, ignores)
+    options = task.executor(ha_config_scan.load_options)
+    findings, hidden = _findings(deps, items, ignores, options["skip_label"])
     stamp = _now()
     summary = _summarise(findings, hidden, {
         "generated": stamp, "last_scan_iso": _iso_now(),
@@ -606,7 +607,7 @@ PROBLEM_WORD = {
 }
 
 
-def _findings(deps, missing, ignores):
+def _findings(deps, missing, ignores, skip_label="skip_health_checks"):
     """Every actionable finding the backend can see, classified and de-ignored.
 
     One row per (owner, reference): an automation naming the same silent sensor
@@ -626,6 +627,11 @@ def _findings(deps, missing, ignores):
         rule = ha_config_scan.is_ignored(ignores, kind, ref, item_key, labels.get(ref))
         if rule:
             hidden[rule] = hidden.get(rule, 0) + 1
+            return
+        # A skipped device is skipped everywhere. Only the runtime verdicts go
+        # quiet: a reference to an entity that has actually been deleted is a
+        # broken configuration whether or not the device is skipped.
+        if severity != "broken" and skip_label in (labels.get(ref) or ()):
             return
         seen.add(fp)
         out.append({
@@ -749,7 +755,8 @@ def config_health_runtime():
     state = task.executor(ha_config_scan.load_notify_state)
     ignores = task.executor(ha_config_scan.load_ignores)
     missing = _DEPS.get("missing") or []
-    findings, hidden = _findings(deps, missing, ignores)
+    options = task.executor(ha_config_scan.load_options)
+    findings, hidden = _findings(deps, missing, ignores, options["skip_label"])
     summary = _summarise(findings, hidden, {
         "generated": _now(), "last_scan_iso": _iso_now(),
         "files": None, "dependencies": len(deps), "next_scan": _next_scan(),

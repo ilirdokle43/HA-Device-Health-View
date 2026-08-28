@@ -4,6 +4,18 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.28.3
+
+### Fixed
+
+- **Skip now means skipped everywhere.** Skipping a device took it out of the device list but
+  left every configuration item that references it reporting as impaired - a 3D printer that
+  travels between two houses put seven rows on a dashboard for being switched off in the house
+  it was not in. The runtime join and the backend both honour the skip label now, so the page,
+  the health sensors and the notifications agree. Only the runtime verdicts go quiet:
+  **a reference to an entity that has actually been deleted is still broken**, skipped device
+  or not. `exclude_devices` in the card's own YAML skips the same way.
+
 ## 2026.8.28.2
 
 ### Fixed

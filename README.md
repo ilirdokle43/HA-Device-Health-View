@@ -157,6 +157,13 @@ A skipped device leaves the monitored population altogether rather than being co
 healthy: calling a deliberately powered-off machine "online" would be as wrong as calling it
 offline.
 
+**Skipping also silences the configuration half.** An automation or dashboard that references a
+skipped device stops being reported as impaired, because "this device is off on purpose" and
+"this automation cannot run today" are the same fact told twice. A 3D printer that travels
+between two houses is switched off in one of them by definition. What skipping does *not* hide
+is a reference to an entity that has genuinely been deleted — that is broken configuration
+whether or not the device is skipped.
+
 The list is stored as a **label on the device registry**, not in the browser, for two
 reasons: it is install-wide, so skipping a device at a desk also skips it on every wall
 tablet; and it is visible and removable in **Settings → Devices**, so the state is never
