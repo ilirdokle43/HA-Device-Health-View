@@ -50,7 +50,7 @@
  *
  * No build step. Plain custom element + Shadow DOM.
  *
- * @version 2026.8.25.4
+ * @version 2026.8.30
  * @license MIT
  */
 

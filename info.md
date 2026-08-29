@@ -19,6 +19,13 @@ configuration points at still exist**.
 - **Ignore what you have already decided about**, in six scopes, each showing what it would
   hide before you commit.
 - **Two compact alert tiles** for a main dashboard that disappear entirely when nothing is wrong.
+- **Unstable devices** — the ones that come and go rather than staying down, measured over a
+  day with Home Assistant's own restarts masked out so a reboot is not blamed on a device.
+- **System health**: integrations that are failing, add-ons that did not start, Repairs,
+  Supervisor issues, backup age, and automations or scripts that ran and failed.
+- **Findings survive a restart.** Home Assistant's error log is memory; restarting empties it.
+  Incidents are persisted, so a fault recurring for days does not read as healthy the moment
+  you reboot for something unrelated.
 - **An optional pyscript backend** that reads the YAML packages and UI helpers the frontend
   cannot, and turns the result into health entities, a report file and a notification when
   something new breaks.

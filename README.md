@@ -56,6 +56,15 @@ button, and it never rewrites a `.storage` file Home Assistant owns.
   dashboard column as on a phone.
 - **No polling.** Runtime health follows the state machine; the configuration scan runs once and
   repeats only when something it read has actually changed.
+- **System health.** Integrations that are failing, add-ons that did not start, Home Assistant
+  Repairs, Supervisor issues and the age of the last successful backup, each with its own tier.
+- **Execution errors.** Automations and scripts that ran and failed — the step that failed and
+  how many times — rather than only configurations that are wrong on paper.
+- **Unstable devices.** Devices that come and go rather than staying down, measured over a day
+  and with Home Assistant's own restarts masked out so a reboot is not charged to a device.
+- **Incidents survive a restart.** `system_log` is memory: restarting Home Assistant empties it.
+  Findings are persisted, so a fault that has been recurring for days does not read as healthy
+  the moment you reboot for something unrelated.
 
 ## Installation
 
@@ -222,6 +231,8 @@ pickers, work in automations and templates, and survive a restart.
 | `sensor.config_health_impaired` | count of impaired items | the same shape |
 | `sensor.config_health_warnings` | count of warnings | — |
 | `sensor.config_health_last_scan` | timestamp | — |
+| `sensor.config_health_execution_errors` | count of automations/scripts that ran and failed | the failing item, the step, first and last occurrence |
+| `sensor.config_health_system` | count of live system findings | integration, add-on, Repairs, Supervisor and backup findings |
 | `button.config_health_rescan` | — | presses run the same scan the card's Rescan button does |
 
 Requires the MQTT integration. Without a broker the card and the panel work exactly as
@@ -334,6 +345,57 @@ comes from the earliest `last_changed` among the entities responsible for the ve
 A device can leave the problem list for two very different reasons, and the device registry is
 what tells them apart: still registered means it started answering again (**recovered**, green);
 gone from the registry means it was deleted (**deleted**, grey and deliberately uncelebratory).
+
+## System health
+
+Separate from both device health and configuration health: things that are wrong with Home
+Assistant itself rather than with a device or a reference. Each finding carries one of
+`BROKEN` · `EXECUTION ERROR` · `IMPAIRED` · `WARNING`, and only the first three reach the
+compact tiles.
+
+| Finding | What raises it |
+|---|---|
+| **Execution errors** | An automation or script that ran and failed — which step, what the error was, how many times and over what span. Repeated failures of the same step are one incident, not ninety-four. |
+| **Integration failures** | An integration logging errors persistently. Judged on the integration's own data path, so a fault is not masked by an unrelated entity of the same integration that happens to be fine. |
+| **Add-ons** | An add-on in an error state, or one set to start on boot that is not running. An add-on set to start manually and currently stopped is working as configured and is never reported. |
+| **Repairs** | Home Assistant's own repair issues, counted by severity. |
+| **Supervisor issues** | Unresolved supervisor issues, one row each. |
+| **Backups** | The age of the last *successful* automatic backup, and whether the most recent attempt failed. A failed attempt is reported immediately rather than waiting for the age threshold. |
+
+### Incidents survive restarts
+
+`system_log` is in memory. Restarting Home Assistant empties it, so anything derived from it
+disappears — which is how a fault that had been recurring for days could read as healthy the
+moment you restarted for an unrelated reason.
+
+Findings are written to `config/config_health_incidents.json` and reconciled on every pass.
+An incident with no current evidence is not deleted: if Home Assistant restarted since it was
+last seen it becomes **pending** — it was real, and nothing has checked since — and it clears
+only on sustained healthy evidence, never on silence alone. Restarts are detected from the
+Core process's own identity, so reloading pyscript is not mistaken for a restart.
+
+Only a declared set of fields is persisted, and free text is stripped of anything
+credential-shaped and hard-capped, because the file sits next to the configuration.
+
+### Unstable devices
+
+A device that is *down* is already reported. This is the other failure: one that comes and
+goes. Availability is measured over 24 hours from recorder history, and Home Assistant's own
+restarts — plus mass-disconnect events, such as a Zigbee coordinator taking the mesh with it —
+are masked out, so a reboot is never charged to a device. A device recently added is given a
+commissioning grace period, and one that has been quiet for hours is reported as *recently
+recovered* rather than as currently unstable.
+
+### A note on freshness, if you are reading the source
+
+In-process freshness comes from the `State.last_reported` **attribute**. Do not substitute
+`state.as_dict()["last_reported"]`, `as_dict_json`, or the websocket's `last_reported`: those
+are served from a cached representation. `State._as_dict` is an `@under_cached_property`, and
+a write that produces the same state *and* the same attributes takes Home Assistant's fast
+path, mutating the attribute on the existing object without rebuilding that cache. For an
+entity whose value does not change, the serialised timestamp freezes at the moment the object
+was created while the attribute keeps advancing. `last_updated` is not a substitute either —
+it only moves when the value actually changes.
 
 ## The configuration inspector
 
@@ -466,7 +528,12 @@ two green "all good" lines and the integration grid.
 - **Deleting an area, floor, label or device does not invalidate the page by itself.** Only the
   entity registry is watched; the rest is picked up by the next scan.
 - **The health entities need MQTT.** Without a broker the card, the panel, the report and the
-  notifications all still work; only the six entities and the Rescan button are absent.
+  notifications all still work; only the health entities and the Rescan button are absent.
+- **Add-on, Repairs and Supervisor findings need the Supervisor.** On a Home Assistant Core or
+  container install those checks are silently skipped rather than reported as failures.
+- **Unstable-device history needs the recorder.** With recorder disabled or a very short
+  retention, the 24-hour availability measurement has nothing to read and the section stays
+  empty.
 
 ## Licence
 
