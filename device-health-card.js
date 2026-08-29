@@ -61,7 +61,7 @@
      matches the newest CHANGELOG heading: a banner that lies about which
      build is loaded is worse than no banner, because a stale page and an
      up-to-date one then look identical. */
-  const CARD_VERSION = '2026.8.29.5';
+  const CARD_VERSION = '2026.8.30';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *

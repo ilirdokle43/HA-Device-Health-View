@@ -1201,6 +1201,41 @@ def _iso_epoch(stamp):
         return None
 
 
+def freshness_stamp(state):
+    """When Home Assistant last WROTE this state, as an ISO string.
+
+    This exists as a separate function for one reason: the choice it makes
+    is the exact place a silent bug lived for weeks, and a function can be
+    tested against a fake State while a line buried in a pyscript helper
+    cannot.
+
+    It reads the `last_reported` ATTRIBUTE. It must never read
+    `state.as_dict()["last_reported"]`, `as_dict_json`, or anything the
+    websocket serves, because those are cached:
+
+      - `State._as_dict` is an `@under_cached_property`, built once per
+        State object
+      - a write with the same state and the same attributes takes Home
+        Assistant's fast path, which mutates `last_reported` on the
+        existing object and never rebuilds the cached dict
+
+    So for an entity whose value does not change - a switch that stays on,
+    a camera privacy toggle that stays off - the serialised timestamp
+    freezes at the moment the object was created, typically the last
+    restart, while the attribute keeps advancing. Fed the serialised value,
+    a freshness check measures the age of an object rather than the age of
+    the data, and reports a healthy integration as a hung one.
+
+    `last_updated` is not a substitute either: it only moves when the state
+    or attributes actually change, so a coordinator polling unchanged
+    values would look frozen for the opposite reason.
+    """
+    raw = getattr(state, "last_reported", None)
+    if raw is None:
+        return None
+    return raw.isoformat() if hasattr(raw, "isoformat") else str(raw)
+
+
 def evidence_group(entity_stamps, previous=None, tolerance_ms=EVIDENCE_TOLERANCE_MS):
     """The entities an integration's coordinator writes together.
 
@@ -1209,7 +1244,14 @@ def evidence_group(entity_stamps, previous=None, tolerance_ms=EVIDENCE_TOLERANCE
     single entity when the integration only has one.
 
     Members are found by clustering timestamps within a tolerance, NOT by
-    string equality. The first version of this compared the stamps exactly,
+    string equality.
+
+    Note what this is NOT for. It was built to separate a live-view camera
+    stream from the coordinator entities it appeared to outlive; measured
+    correctly, that stream writes with the rest of them and there was
+    nothing to separate. What remains genuine is an integration owning more
+    than one coordinator: those paths carry different write times, and
+    clustering stops a hung one being masked by a healthy one. The first version of this compared the stamps exactly,
     on the assumption that a coordinator writing its entities in one pass
     gives them one timestamp. It does not. Home Assistant stamps each state
     write as it makes it, so the six entities of a TP-Link camera came back
@@ -1269,12 +1311,14 @@ def evidence_group(entity_stamps, previous=None, tolerance_ms=EVIDENCE_TOLERANCE
             return [only], entity_stamps[only]
         return [], None
 
-    if previous:
-        keep = sorted(set(best) & set(previous))
-        if keep:
-            # The remembered group still exists; narrow to it and report the
-            # stamp those members actually share.
-            return keep, _stamp_of(keep)
+    # `previous` is accepted and ignored. It used to intersect each new
+    # group with the remembered one, to converge away from the case where
+    # "every entity of an integration shares the startup timestamp". That
+    # case was an artifact of reading the cached serialisation, where a
+    # timestamp only moves when a State object is rebuilt. Measured on the
+    # attribute, a coordinator's entities agree on EVERY pass, so a single
+    # observation already gives the right group and narrowing it can only
+    # shrink the evidence.
     return best, _stamp_of(best)
 
 
@@ -1529,6 +1573,16 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
             rec["cadence"] = cadence_note(rec.get("cadence"), advanced)
         fast = cadence_is_fast(rec.get("cadence"))
         stale = evidence_is_stale(stamp_ts, now_ts, interval_seconds)
+
+        # An escalation reason must not outlive the condition that raised
+        # it. Path A and Path B only ever raise, which is right while the
+        # evidence still supports them - but a record carrying "coordinator
+        # data stale" whose path is demonstrably writing again is asserting
+        # something false, and it would keep asserting it until retention
+        # expired. Clearing the reason lets the ordinary error rules decide
+        # the severity on their own.
+        if not stale and str(rec.get("reason") or "").endswith("stale"):
+            rec.pop("reason", None)
 
         if rec.get("status") == "pending":
             if advanced and not stale:

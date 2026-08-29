@@ -802,10 +802,17 @@ def _evidence_paths(domains, store):
     but a coordinator writes all of its entities in one pass, so they agree
     to the microsecond and entities on their own schedule do not.
 
-    This replaces asking "is the newest entity of this integration fresh?",
-    which a camera disproved: when the TP-Link coordinator hangs, six
-    entities freeze together while the live-view stream carries on, and the
-    newest entity is the one thing that never broke.
+    Grouping is NOT about excluding a live stream. That rationale came from
+    the cache bug described below: `camera.…_live_view` appeared to keep
+    updating while six entities froze, but measured on the attribute all
+    seven write together to within a millisecond, every pass. The stream is
+    coordinator-written like everything else.
+
+    What grouping is still for is an integration that owns several
+    coordinators - entities on different update paths carry genuinely
+    different write times, and clustering keeps a hung path from being
+    masked by a healthy one. For a single-coordinator integration it simply
+    returns everything, which is the right answer.
     """
     out = {}
     if not domains:
@@ -820,26 +827,38 @@ def _evidence_paths(domains, store):
             st = hass.states.get(ent.entity_id)
             if st is None:
                 continue
-            # `st.last_reported` is read through as_dict(), not off the
-            # attribute, because on this Home Assistant the attribute and
-            # `last_reported_timestamp` both hand back the time of the call
-            # rather than the time of the write - identical to the
-            # microsecond for every entity asked in one pass:
+            # Freshness comes off the ATTRIBUTE. It must not be read through
+            # as_dict() or the websocket, and the reason is worth keeping,
+            # because the wrong version of this line survived a full test
+            # suite and reported a healthy camera as a hung coordinator for
+            # hours.
             #
-            #   .last_reported          18:39:58.763330   (all seven alike)
-            #   .as_dict()              18:35:10.221002   (agrees with the
-            #   .as_dict_json           18:35:10.221002    websocket)
+            # `State._as_dict` is an `@under_cached_property`, built once per
+            # State object. When a write produces the same state AND the same
+            # attributes, `async_set_internal` takes a fast path: it mutates
+            # `old_state.last_reported = now`, updates the
+            # `last_reported_timestamp` cache entry, and deliberately avoids
+            # building a new State object - without invalidating the cached
+            # `_as_dict`. So for an entity whose value does not change, the
+            # serialised form keeps reporting the moment its State object was
+            # born, while the attribute advances on every write.
             #
-            # Fed the attribute, this function reported every integration as
-            # one perfectly synchronised group that had just written, so
-            # nothing could ever look stale and a frozen coordinator read as
-            # healthy on every pass.
+            # Measured on one State object at one instant, fourteen minutes
+            # into what looked like a coordinator freeze:
+            #
+            #   .last_reported             22:46:48.072   <- 0s old, correct
+            #   .as_dict()[last_reported]  22:32:46.115   <- 14m stale, cached
+            #   websocket get_states       22:32:46.115   <- 14m stale, cached
+            #
+            # The earlier note here claimed the opposite. It misread seven
+            # entities carrying near-identical attribute stamps as "the time
+            # of the call"; that is simply what one coordinator pass looks
+            # like, and it was the correct answer all along.
             try:
-                raw = st.as_dict().get("last_reported")
-                if raw is None:
+                stamp = ha_config_scan.freshness_stamp(st)
+                if stamp is None:
                     continue
-                stamps.setdefault(ent.platform, {})[ent.entity_id] = (
-                    raw.isoformat() if hasattr(raw, "isoformat") else str(raw))
+                stamps.setdefault(ent.platform, {})[ent.entity_id] = stamp
             except Exception:
                 continue
         for domain, entity_stamps in stamps.items():

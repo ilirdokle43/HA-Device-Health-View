@@ -4,6 +4,38 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.30
+
+### Fixed
+
+- **Freshness was being read from a cache, and reported a healthy integration as a hung
+  one.** `State._as_dict` is an `@under_cached_property`. When a write produces the same state
+  AND the same attributes, Home Assistant takes a fast path: it mutates `last_reported` on the
+  existing State object and never rebuilds that cache. So for an entity whose value does not
+  change - a switch that stays on, a detection toggle that stays off - `as_dict()`, `as_dict_json`
+  and every websocket consumer keep reporting the moment the object was created, usually the last
+  restart, while the attribute advances on every write. Measured on one object at one instant,
+  fourteen minutes into an apparent coordinator freeze: attribute 0s old, serialised 14m stale.
+  Operational freshness now reads the attribute, through a `freshness_stamp()` function that
+  exists so the choice can be tested against a fake State.
+
+  The cost of the wrong version: a TP-Link camera polling successfully every five seconds was
+  escalated to a critical "coordinator data stale" incident that could never recover, because the
+  evidence its recovery depended on was a timestamp that could not move.
+
+- **Evidence grouping no longer serves a problem that never existed.** It was built to separate a
+  camera's live-view stream from the coordinator entities it appeared to outlive. Measured on the
+  attribute, all seven entities of that integration write together within a millisecond, every
+  pass - the stream included. The `previous`-group intersection, which existed only to converge
+  away from the cached view's restart artifact, is removed. Clustering is kept for the reason that
+  survives: an integration owning several coordinators has genuinely different write times per
+  path, and clustering stops a hung path being masked by a healthy one.
+
+- **An escalation reason no longer outlives the condition that raised it.** Path A and Path B only
+  ever raise, which is correct while the evidence holds - but a record asserting "coordinator data
+  stale" whose path is demonstrably writing again kept asserting it until retention expired. A
+  non-stale pass now clears the reason and lets the ordinary error rules set severity.
+
 ## 2026.8.29.5
 
 ### Added
