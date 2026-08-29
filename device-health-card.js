@@ -61,7 +61,7 @@
      matches the newest CHANGELOG heading: a banner that lies about which
      build is loaded is worse than no banner, because a stale page and an
      up-to-date one then look identical. */
-  const CARD_VERSION = '2026.8.29.4';
+  const CARD_VERSION = '2026.8.29.5';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -5399,7 +5399,12 @@
     /* Merged already, so this cannot double-count overlapping windows - and
        the denominator has to shrink by exactly the time that was excluded or
        availability would be charged for it. */
-    const maskedMs = masked.reduce((sum, m) => sum + (Math.min(m[1], now) - Math.max(m[0], start)), 0);
+    /* Clamped at zero per window. Restarts are kept for two days but the
+       measurement window is one, so a window can sit entirely before `start`
+       - and an unclamped subtraction turns that into a NEGATIVE contribution,
+       inflating the measured span and quietly improving availability. */
+    const maskedMs = masked.reduce(
+      (sum, m) => sum + Math.max(0, Math.min(m[1], now) - Math.max(m[0], start)), 0);
 
     const out = [];
     for (const entityId in series) {
@@ -5637,7 +5642,12 @@
             (i.entries > 1 ? ' · ' + i.domain + ', entry not identified' : '') +
             (i.reason === 'coordinator path stale'
               ? ' · its data path has stopped updating'
-              : ' · still failing'),
+              : i.reason === 'repeated errors, coordinator data stale'
+                /* Path B: no learned cadence to appeal to, so the row says
+                   what was actually observed - repeated errors, and a
+                   coordinator that has not written since. */
+                ? ' · repeated errors · coordinator data stale'
+                : ' · still failing'),
         severity: pending ? 'warning' : status,
         url: '/config/integrations/integration/' + i.domain,
         note: pending ? (i.errors + ' errors up to ' + String(i.last || '').slice(11, 16)) : i.message,

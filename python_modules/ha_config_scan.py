@@ -1298,11 +1298,106 @@ def cadence_is_fast(history, window=CADENCE_WINDOW, ratio=CADENCE_FAST_RATIO):
     return (sum(hist) / float(len(hist))) >= ratio
 
 
+# --- path B: the integration that was already broken when we arrived ---
+#
+# Path A escalates on a learned cadence: an evidence group that has been
+# seen advancing faster than we sample, and then stops. That is the right
+# rule for something that fails while we are watching it.
+#
+# It cannot fire for something that was already frozen when observation
+# began, because a frozen group never advances and so never demonstrates a
+# cadence. The camera proved this the hard way: two real errors, a
+# coordinator that had not written for twenty-six minutes, and a cadence
+# gate that could only ever count downwards. Path A was not wrong; it was
+# structurally inapplicable, and it was the only path there was.
+#
+# Path B needs no cadence history. It rests on repeated REAL errors and an
+# evidence group that is demonstrably not moving. Both halves are required:
+# staleness alone never reaches this code, so a slow integration that is
+# not throwing errors is never evaluated here. This is deliberately not
+# general stale-telemetry monitoring.
+
+# Two errors is the smallest number that distinguishes a fault from an
+# incident. One is transient and stays evidence.
+FROZEN_MIN_ERRORS = 2
+
+# ...and they have to be spread out. Two errors a second apart is one event
+# retried; two errors ten minutes apart is a condition.
+FROZEN_MIN_SPAN_SECONDS = 600
+
+# How long the evidence group must have been still. Ten minutes is two
+# operational passes plus margin, and comfortably longer than any single
+# slow poll this system has been observed to make.
+FROZEN_MIN_STALE_SECONDS = 600
+
+# Critical wants more of everything: more errors, over a longer span, with
+# the group still not moving.
+FROZEN_CRITICAL_ERRORS = 3
+FROZEN_CRITICAL_SPAN_SECONDS = 1800
+
+# Entities whose freshness is driven by something other than the polling
+# coordinator - a stream, a pushed image. They can sit in the evidence
+# group while the coordinator is healthy, because they are written in the
+# same pass, but they are not evidence that the coordinator is alive. A
+# group made only of these cannot support Path B at all.
+PROXY_DOMAINS = ("camera", "image", "media_player")
+
+
+def evidence_has_coordinator_entity(members, proxy_domains=PROXY_DOMAINS):
+    """Does the group contain something a coordinator actually polls?
+
+    `camera.…_live_view` kept updating from its own stream for the whole
+    time the TP-Link coordinator was hung. A group holding nothing but
+    entities like that says nothing about the coordinator either way.
+    """
+    for entity_id in (members or []):
+        if str(entity_id).split(".", 1)[0] not in proxy_domains:
+            return True
+    return False
+
+
+def frozen_escalation(observed, first_ts, last_ts, stamp_ts, now_ts, members,
+                      min_errors=FROZEN_MIN_ERRORS,
+                      min_span=FROZEN_MIN_SPAN_SECONDS,
+                      min_stale=FROZEN_MIN_STALE_SECONDS,
+                      critical_errors=FROZEN_CRITICAL_ERRORS,
+                      critical_span=FROZEN_CRITICAL_SPAN_SECONDS):
+    """Path B. Returns None, "warning" or "critical".
+
+    `observed` is the cumulative real-error count for this fingerprint -
+    the one that survives a restart, not system_log's resettable counter.
+    `stamp_ts` is the evidence group's own last write.
+
+    Every clause is required. In particular there is no route through here
+    that does not involve real, repeated, spread-out errors.
+    """
+    if not members or not evidence_has_coordinator_entity(members):
+        return None
+    if stamp_ts is None or first_ts is None or last_ts is None:
+        return None
+    if int(observed or 0) < min_errors:
+        return None
+    if (last_ts - first_ts) < min_span:
+        return None
+    stale_for = now_ts - stamp_ts
+    if stale_for < min_stale:
+        return None
+    if int(observed or 0) >= critical_errors and             (last_ts - first_ts) >= critical_span:
+        return "critical"
+    return "warning"
+
+
 def evidence_is_stale(stamp_ts, now_ts, interval_seconds, intervals=STALE_INTERVALS):
     """Is the evidence group abnormally stale for something this fast?"""
     if stamp_ts is None:
         return False
     return (now_ts - stamp_ts) >= (intervals * interval_seconds)
+
+
+# How the operational statuses order when one has to win, so that an
+# escalation path can raise an incident but never walk it back down.
+_RANK = {"recovered": 0, "evidence": 1, "pending": 2, "warning": 3,
+         "critical": 4, "actionable": 4}
 
 
 def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
@@ -1405,6 +1500,15 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
             rec["healthy_passes"] = 0
         elif prev.get("status") in ("pending", "evidence"):
             rec["status"] = prev.get("status")
+        elif was_open:
+            # An open incident whose errors merely STOPPED is not recovered.
+            # Errors stop for two reasons - the integration started working,
+            # or it stopped being asked - and a hung coordinator produces the
+            # second while looking exactly like the first. So it drops to
+            # `pending` and has to earn its way out on the evidence path,
+            # the same as an incident that survived a restart.
+            rec["status"] = "pending"
+            rec["healthy_passes"] = int(prev.get("healthy_passes") or 0)
         else:
             rec["status"] = "recovered"
         keep_integ[fp] = rec
@@ -1433,17 +1537,33 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
                     rec["status"] = "recovered"
             else:
                 rec["healthy_passes"] = 0
-        elif rec.get("status") in ("evidence", "warning"):
-            # The scoped clause. An integration that has thrown errors and
-            # whose own coordinator path has stopped moving - when that path
-            # has demonstrably been moving faster than we sample - is failing
-            # now, whatever the error counter says. This is the difference
-            # between noticing a hung camera in fifteen minutes and noticing
-            # it in two hours.
-            if fast and stale and _epoch(rec.get("last")) and \
-                    (now_ts - _epoch(rec["last"])) <= retain:
+        elif rec.get("status") in ("evidence", "warning", "critical"):
+            # Path A - the scoped clause. An integration that has thrown
+            # errors and whose own coordinator path has stopped moving -
+            # when that path has demonstrably been moving faster than we
+            # sample - is failing now, whatever the error counter says.
+            # This is the difference between noticing a hung camera in
+            # fifteen minutes and noticing it in two hours.
+            fresh_enough = bool(_epoch(rec.get("last"))) and \
+                (now_ts - _epoch(rec["last"])) <= retain
+            if fast and stale and fresh_enough:
                 rec["status"] = "critical"
                 rec["reason"] = "coordinator path stale"
+            else:
+                # Path B - no cadence history required. For an integration
+                # that was already frozen when we started watching, Path A
+                # can never become true, because a group that never moves
+                # never demonstrates a cadence. Repeated real errors against
+                # a motionless evidence group have to carry it alone.
+                level = frozen_escalation(
+                    rec.get("observed"), _epoch(rec.get("first")),
+                    _epoch(rec.get("last")), stamp_ts, now_ts, members)
+                # Only ever raises. A pass that no longer qualifies must
+                # not quietly walk an incident back down - recovery is the
+                # evidence path's job, and it has its own proof requirement.
+                if level and _RANK.get(level, 0) > _RANK.get(rec.get("status"), 0):
+                    rec["status"] = level
+                    rec["reason"] = "repeated errors, coordinator data stale"
 
     for fp, rec in keep_integ.items():
         integrations[fp] = dict(rec, verified=fp in seen_live)

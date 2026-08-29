@@ -4,6 +4,40 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.29.5
+
+### Added
+
+- **A second escalation path, for integrations that were already broken when we arrived.**
+  The existing rule escalates on a *learned cadence*: a coordinator seen advancing faster than
+  we sample, that then stops. It cannot fire for something already frozen when observation
+  began, because a frozen path never advances and so never demonstrates a cadence. The camera
+  sat in that blind spot for twenty-six minutes with two real errors on the record. The new
+  path needs no cadence history: repeated real errors, spread over time, against an evidence
+  group that is demonstrably not moving. Both halves are required - staleness alone never
+  reaches it, so an integration that is not throwing errors is never evaluated. Warning at two
+  errors ten minutes apart with the group still ten minutes stale; critical at three
+  errors over thirty. A group made only of streaming entities cannot support it at all.
+
+### Fixed
+
+- **A restart is what the Home Assistant process says it is.** The startup trigger fires on
+  `pyscript.reload` as well as on Core startup and cannot tell them apart, so every reload was
+  recorded as a restart: a fake entry in the restart history, live incidents marked `pending`,
+  and a three-minute masking window opened over the unstable-device detector. Three such
+  entries were in the store, none of them a restart. The Core process's own start time is the
+  marker now, read from `/proc/self/stat`, with the recorder run as a fallback.
+
+- **Errors stopping is not the same as an integration recovering.** An open incident whose
+  errors merely stopped was called recovered. Errors stop for two reasons - the integration
+  started working, or it stopped being asked - and a hung coordinator produces the second while
+  looking exactly like the first. Such an incident now drops to `pending` and has to earn its
+  way out on the evidence path, three advancing passes, the same as one that survived a restart.
+
+- **Masked time can no longer be negative.** Restarts are kept for two days but availability is
+  measured over one, so a restart window can sit entirely before the measurement starts.
+  Subtracting it unclamped *added* time to the measured span and quietly improved availability.
+
 ## 2026.8.29.4
 
 ### Fixed

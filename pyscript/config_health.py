@@ -12,7 +12,9 @@ Services:
   pyscript.config_health_fix  entity_id=<missing> replacement=<existing>
 """
 
+import io
 import json
+import os
 import sys
 import time
 
@@ -472,6 +474,11 @@ OPS_ENTITY = "pyscript.config_health_ops"
 # seconds, so changing the cron changes them together.
 OPS_INTERVAL_SECONDS = 300
 
+# How long a Home Assistant restart stays on the record for availability
+# masking. Two days covers a weekend of reboots without letting the list
+# grow into a log; nothing downstream looks further back than a day.
+RESTART_RETAIN_SECONDS = 48 * 3600
+
 # The label that marks an automation as safety-critical, where one failed
 # attempt is already the whole story. It is read from the entity registry and
 # never inferred: an automation is safety-critical because someone said so,
@@ -852,6 +859,74 @@ def _evidence_paths(domains, store):
     return out
 
 
+def _ha_boot_marker():
+    """Something that changes when, and only when, Core actually restarts.
+
+    `@time_trigger("startup")` cannot answer this. It fires whenever
+    pyscript starts, and `pyscript.reload` starts pyscript - so every
+    reload was being recorded as a Home Assistant restart, appending a
+    fake entry to the restart history, marking live incidents `pending`
+    and opening a three-minute masking window over the unstable-device
+    detector. Three of those were in the store before this was fixed, none
+    of them real.
+
+    The Core process's own start time is the marker. `/proc/self/stat`
+    field 22 is the process start in clock ticks since the machine booted,
+    and `/proc/uptime` says how long ago that was; together they give an
+    absolute time that survives a pyscript reload untouched and changes on
+    every Core restart. Measured against a real restart it read 18:51:44
+    where the recorder's new run row said 18:51:47 - the three seconds
+    between the process starting and the recorder opening its run.
+
+    The recorder run is the fallback: it is Core-owned and equally correct,
+    but it depends on the recorder being loaded and the process does not.
+    Returns None if neither can be read, and a None marker never claims a
+    restart.
+    """
+    try:
+        fh = io.open("/proc/self/stat")
+        fields = fh.read().split()
+        fh.close()
+        ticks = float(fields[21])
+        fh = io.open("/proc/uptime")
+        uptime = float(fh.read().split()[0])
+        fh.close()
+        hz = os.sysconf("SC_CLK_TCK")
+        started = time.time() - uptime + (ticks / hz)
+        # Whole seconds. The arithmetic can wobble in the last decimal
+        # between passes, and a marker that changes on its own would report
+        # a restart every five minutes.
+        return "proc:%d" % int(started)
+    except Exception:
+        pass
+    try:
+        from homeassistant.components.recorder import get_instance
+        return "recorder:%s" % get_instance(hass).recorder_runs_manager.current.start.isoformat()
+    except Exception:
+        return None
+
+
+def _boot_changed(store):
+    """Has Core restarted since the store was last written?
+
+    Also the place where the marker is initialised. A store that has never
+    seen a marker must not invent a historical restart - we simply did not
+    know before now, and claiming a restart would mask device drops that
+    really happened.
+    """
+    marker = _ha_boot_marker()
+    if not marker:
+        return False
+    stored = store.get("boot")
+    if not stored:
+        store["boot"] = marker
+        return False
+    if marker == stored:
+        return False
+    store["boot"] = marker
+    return True
+
+
 def _record_restart(store):
     """Remember when Home Assistant started, for the unstable-device mask.
 
@@ -864,7 +939,7 @@ def _record_restart(store):
     """
     stamps = [s for s in (store.get("restarts") or []) if isinstance(s, str)]
     stamps.append(_iso_now())
-    cut = time.time() - 26 * 3600
+    cut = time.time() - RESTART_RETAIN_SECONDS
     keep = []
     for s in stamps[-40:]:
         try:
@@ -916,7 +991,11 @@ async def _ops_scan(background=True):
 
     # Fold this scan's evidence into what survived the last restart.
     store = task.executor(ha_config_scan.load_incidents)
-    restarted = bool(_OPS.pop("restarted", False))
+    # A restart is what the Core process says it is. The startup trigger
+    # is not consulted: it fires on `pyscript.reload` too, and treating
+    # that as a restart is what filled the history with entries for
+    # reloads that had dropped nothing.
+    restarted = _boot_changed(store)
     if restarted:
         _record_restart(store)
     # Every integration we already know something about, plus anything that
@@ -1367,9 +1446,10 @@ async def config_health_startup():
     state["grace_until"] = time.strftime(
         "%Y-%m-%d %H:%M:%S", time.localtime(time.time() + STARTUP_GRACE_SECONDS))
     task.executor(ha_config_scan.save_notify_state, state)
-    # The next operational pass must know a restart happened: system_log is
-    # empty, so "no evidence" would otherwise read as "nothing wrong".
-    _OPS["restarted"] = True
+    # Note what is NOT set here. This trigger used to raise a "restarted"
+    # flag for the next operational pass, but it fires on `pyscript.reload`
+    # as well as on Core startup and cannot tell the two apart. The pass
+    # asks the Core process directly instead - see `_boot_changed`.
     _publish_discovery()
     _run_scan(manual=True)
     await _ops_scan()
