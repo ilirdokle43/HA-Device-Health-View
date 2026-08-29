@@ -5577,7 +5577,14 @@
             (e.enabled ? '' : '<div class="exline"><span>Automation</span><span>currently switched off</span></div>') +
             '<div class="exact"><button class="exopen" type="button" data-execopen="' + esc(e.entity_id) + '">' +
             '<ha-icon icon="mdi:open-in-new"></ha-icon>Open ' + (e.type === 'script' ? 'script' : 'automation') +
-            '</button></div></div>'
+            '</button>' +
+            /* Home Assistant keeps only the last five runs of an item, so on
+               something that runs every minute the traces cover five minutes
+               and this incident is already older than all of them. The link
+               is still the right place to look at what it is doing NOW. */
+            '<button class="exopen" type="button" data-exectrace="' + esc(e.entity_id) + '">' +
+            '<ha-icon icon="mdi:history"></ha-icon>Traces</button>' +
+            '</div></div>'
           : '') +
         '</div>';
     };
@@ -6245,7 +6252,7 @@ ha-card.mini.overall { overflow: hidden; }
 .exline { display: grid; grid-template-columns: 128px 1fr; gap: 8px; font-size: 0.82em; }
 .exline > span:first-child { opacity: 0.6; }
 .exline > span:last-child { word-break: break-word; }
-.exact { margin-top: 6px; }
+.exact { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
 .exopen {
   display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font: inherit;
   font-size: 0.82em; padding: 5px 10px; border-radius: 8px; background: transparent;
@@ -7445,6 +7452,17 @@ ha-card.mini.overall { overflow: hidden; }
       }));
     }
 
+    /** The trace list for an automation or script. */
+    _openTraces(entityId) {
+      const domain = domainOf(entityId);
+      if (domain === 'script') {
+        return this._navigate('/config/script/trace/' + entityId.split('.')[1]);
+      }
+      const st = this._hass && this._hass.states[entityId];
+      const id = st && st.attributes && st.attributes.id;
+      if (id) this._navigate('/config/automation/trace/' + id);
+    }
+
     _navigate(path) {
       history.pushState(null, '', path);
       window.dispatchEvent(new CustomEvent('location-changed', { bubbles: true, composed: true }));
@@ -7488,6 +7506,12 @@ ha-card.mini.overall { overflow: hidden; }
               composed: true,
             })
           );
+          return;
+        }
+        const execTrace = ev.target.closest('[data-exectrace]');
+        if (execTrace) {
+          ev.stopPropagation();
+          this._openTraces(execTrace.dataset.exectrace);
           return;
         }
         const execOpen = ev.target.closest('[data-execopen]');
