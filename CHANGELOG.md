@@ -4,6 +4,33 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.29.3
+
+### Fixed
+
+- **Operational incidents no longer vanish when Home Assistant restarts.** Execution and
+  integration errors are read from `system_log`, which is memory: a restart empties it, and
+  every incident derived from it disappeared with it. A camera that had been failing for four
+  days became "healthy" the instant Home Assistant was restarted for an unrelated reason, and
+  a water pump's ninety-four failed shutdowns stopped being on the record. Incidents are now
+  kept in the existing JSON store with their fingerprint, owner, one-line summary, count, first
+  and last sighting, safety flag and status.
+- **A restart no longer produces a false green.** An incident with no live evidence is not
+  assumed healed. If Home Assistant restarted since it was last seen it becomes **pending** -
+  *"previous failure, awaiting post-restart validation"* - which is shown, counted, and
+  deliberately never notified. Fresh errors reactivate the same incident rather than starting a
+  new one. A pending integration recovers only on evidence: three consecutive scans in which
+  that integration is actually producing fresh telemetry, never on silence.
+- Integration errors are consolidated **per integration** rather than per log line, so one
+  failing camera is one row, and the fingerprint survives an upgrade moving the source line.
+- Supervisor resolution issues are reported one row per issue type, so a single permanent one
+  can be silenced without blinding the rest.
+
+### Internal
+
+- Only declared fields reach the incident store - an allow-list, not a filter - and the single
+  free-text field is stripped of anything credential-shaped and capped at 160 characters.
+
 ## 2026.8.29.2
 
 ### Fixed

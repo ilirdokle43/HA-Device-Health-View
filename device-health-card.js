@@ -61,7 +61,7 @@
      matches the newest CHANGELOG heading: a banner that lies about which
      build is loaded is worse than no banner, because a stale page and an
      up-to-date one then look identical. */
-  const CARD_VERSION = '2026.8.29.2';
+  const CARD_VERSION = '2026.8.29.3';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -4150,7 +4150,9 @@
     const ops = model.ops;
     const opsItems = [];
     if (ops) {
-      const failing = ops.execution.filter((e) => e.severity === 'actionable');
+      /* Only what is happening now. `pending` is honest on the page and
+         silent on a main dashboard: it is a prompt to look, not an alarm. */
+      const failing = ops.execution.filter((e) => (e.status || e.severity) === 'actionable');
       if (failing.length) {
         opsItems.push(line(failing.length, 'automation failing', 'automations failing'));
       }
@@ -4159,7 +4161,7 @@
       const backup = ops.system.filter(
         (x) => x.kind === 'backup' && (x.severity === 'actionable' || x.severity === 'critical'));
       if (backup.length) opsItems.push('backup stale');
-      const integ = ops.integrations.filter((i) => i.severity === 'critical');
+      const integ = ops.integrations.filter((i) => (i.status || i.severity) === 'critical');
       if (integ.length) opsItems.push(line(integ.length, 'integration failing', 'integrations failing'));
     }
     if (opsItems.length) {
@@ -4437,7 +4439,7 @@
        which is exactly the case that went unnoticed. Only currently
        recurring incidents qualify: a recovered one is history, and history
        does not belong on a main dashboard. */
-    const failing = ops ? ops.execution.filter((e) => e.severity === 'actionable') : [];
+    const failing = ops ? ops.execution.filter((e) => (e.status || e.severity) === 'actionable') : [];
     if (failing.length) {
       const worst = failing[0];
       return {
@@ -5585,15 +5587,25 @@
        belongs here rather than with the devices: the fault is in the
        integration, and the devices it owns look perfectly fine. */
     for (const i of ops.integrations) {
+      const status = i.status || i.severity;
+      /* A restart empties Home Assistant's error store, so an integration
+         that was failing before it simply stops producing evidence. Calling
+         that healthy is how a camera that had been broken for four days
+         quietly vanished from this page. `pending` says what is actually
+         true: it was failing, and nothing has checked since. */
+      const pending = status === 'pending';
+      if (status === 'recovered') continue;
       rows.push({
         kind: 'integration',
         name: i.entry || i.domain,
-        detail: i.errors + ' error' + (i.errors === 1 ? '' : 's') +
-          (i.entries > 1 ? ' · ' + i.domain + ', entry not identified' : '') +
-          ' · still failing',
-        severity: i.severity,
+        detail: pending
+          ? 'Previous failure · awaiting post-restart validation'
+          : i.errors + ' error' + (i.errors === 1 ? '' : 's') +
+            (i.entries > 1 ? ' · ' + i.domain + ', entry not identified' : '') +
+            ' · still failing',
+        severity: pending ? 'warning' : status,
         url: '/config/integrations/integration/' + i.domain,
-        note: i.message,
+        note: pending ? (i.errors + ' errors up to ' + String(i.last || '').slice(11, 16)) : i.message,
       });
     }
     if (!rows.length) return '';
@@ -5631,16 +5643,18 @@
    */
   function executionHtml(ops, state) {
     if (!ops || !ops.execution.length) return '';
-    const live = ops.execution.filter((e) => e.severity === 'actionable');
-    const past = ops.execution.filter((e) => e.severity !== 'actionable');
+    const statusOf = (e) => e.status || e.severity;
+    const live = ops.execution.filter((e) => statusOf(e) === 'actionable');
+    const held = ops.execution.filter((e) => statusOf(e) === 'pending');
+    const past = ops.execution.filter((e) => statusOf(e) === 'recovered' || statusOf(e) === 'diagnostic');
     const row = (e) => {
-      const current = e.severity === 'actionable';
-      const band = current ? (e.safety ? 'critical' : 'exec') : 'muted';
-      const when = current
-        ? e.failures + ' failed action' + (e.failures === 1 ? '' : 's') +
-          ' · latest ' + esc(String(e.last || '').slice(11, 16))
-        : e.failures + ' failed action' + (e.failures === 1 ? '' : 's') +
-          ' · stopped ' + esc(String(e.last || '').slice(11, 16));
+      const status = statusOf(e);
+      const current = status === 'actionable';
+      const band = current ? (e.safety ? 'critical' : 'exec') : status === 'pending' ? 'exec' : 'muted';
+      const tail = status === 'pending' ? ' · awaiting validation after restart'
+        : current ? ' · latest ' + esc(String(e.last || '').slice(11, 16))
+        : ' · stopped ' + esc(String(e.last || '').slice(11, 16));
+      const when = e.failures + ' failed action' + (e.failures === 1 ? '' : 's') + tail;
       const open = state && state.open && state.open.has('exec:' + e.entity_id);
       return '<div class="execrow band-' + band + (open ? ' is-open' : '') + '" data-exec="' + esc(e.entity_id) + '">' +
         '<div class="exchead">' +
@@ -5677,6 +5691,10 @@
     if (live.length) {
       html += '<div class="exgroup"><span class="exlabel">Execution errors</span>' +
         live.map(row).join('') + '</div>';
+    }
+    if (held.length) {
+      html += '<div class="exgroup"><span class="exlabel">Unverified since restart · ' +
+        held.length + '</span>' + held.map(row).join('') + '</div>';
     }
     if (past.length) {
       html += '<div class="exgroup is-past"><span class="exlabel">Recently recovered · ' +

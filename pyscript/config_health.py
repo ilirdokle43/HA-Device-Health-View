@@ -364,16 +364,23 @@ def _publish_ops(payload):
     reading 1 for six hours after the problem stopped is a sensor nobody can
     build an automation on.
     """
-    execution = [e for e in payload["execution"] if e["severity"] == "actionable"]
+    execution = [e for e in payload["execution"]
+                 if ha_config_scan.incident_is_live(e.get("status"))]
     system = [s for s in payload["system"]
               if s["severity"] in ("actionable", "critical")]
-    integrations = [i for i in payload["integrations"] if i["severity"] == "critical"]
+    # `pending` counts. A problem nobody has re-checked since the restart is
+    # not a problem that went away, and a sensor that reads zero for it would
+    # be the same lie the restart already told once.
+    integrations = [i for i in payload["integrations"]
+                    if ha_config_scan.incident_is_open(i.get("status"))]
     body = {
         "execution": len(execution),
         "system": len(system) + len(integrations),
         "execution_attrs": {
             "recovered": len([e for e in payload["execution"]
-                              if e["severity"] == "recovered"]),
+                              if e.get("status") == "recovered"]),
+            "pending": len([e for e in payload["execution"]
+                            if e.get("status") == "pending"]),
             "failures": sum([e["failures"] for e in execution]),
             "items": [e["name"] for e in execution][:6],
             "generated": payload["generated"],
@@ -733,19 +740,25 @@ async def _ops_system(now_ts):
         sup_issues = res.get("issues") or []
         unsupported = res.get("unsupported") or []
         unhealthy = res.get("unhealthy") or []
-        if sup_issues or unsupported or unhealthy:
-            bits = [i.get("type") for i in sup_issues if i.get("type")]
+        # One row per resolution issue rather than one lumped row, so a single
+        # permanent one can be silenced by ref without blinding the rest.
+        # Deliberately never actionable: no_current_backup is set because Home
+        # Assistant's Core backup manager only ever produces partial backups,
+        # which the supervisor's check does not count - it cannot clear on its
+        # own and must not be allowed to shout.
+        for issue in [i.get("type") for i in sup_issues if i.get("type")]:
             out.append({
-                # Deliberately never actionable. The one issue this install
-                # has - no_current_backup - is set because Home Assistant's
-                # automatic backups are partial (core, add-ons and ssl) while
-                # the supervisor's check only counts full backups, so it can
-                # never clear on its own and must not be allowed to shout.
-                "kind": "supervisor", "ref": "supervisor", "name": "Supervisor",
-                "detail": ", ".join(bits) or "reported an issue",
+                "kind": "supervisor", "ref": issue, "name": "Supervisor",
+                "detail": issue, "severity": "warning",
+                "url": "/config/hardware", "fp": "supervisor:" + issue,
+            })
+        if unsupported or unhealthy:
+            out.append({
+                "kind": "supervisor", "ref": "unhealthy", "name": "Supervisor",
+                "detail": "unsupported or unhealthy installation",
                 "severity": "critical" if unhealthy else "warning",
-                "url": "/config/hardware", "count": len(sup_issues),
-                "items": bits[:6], "fp": "supervisor",
+                "url": "/config/hardware",
+                "items": (unsupported + unhealthy)[:6], "fp": "supervisor:unhealthy",
             })
     ignores = task.executor(ha_config_scan.load_ignores)
     kept = []
@@ -766,6 +779,44 @@ def _stamp(epoch):
         return None
 
 
+def _healthy_domains(pending_domains):
+    """Which of these integrations are demonstrably alive right now.
+
+    Scoped deliberately: this is not stale-telemetry detection over the whole
+    house, it is the single question "has this specific integration, which we
+    know was failing, actually started answering again". An integration whose
+    newest entity reported within the last ten minutes is answering. One whose
+    entities are all frozen is not - which is exactly the state a hung camera
+    sits in while its log stays silent.
+    """
+    out = set()
+    if not pending_domains:
+        return out
+    try:
+        from homeassistant.helpers import entity_registry
+        ereg = entity_registry.async_get(hass)
+        fresh_cut = time.time() - 600
+        by_domain = {}
+        for ent in ereg.entities.values():
+            if ent.platform not in pending_domains or ent.disabled_by:
+                continue
+            st = hass.states.get(ent.entity_id)
+            if st is None:
+                continue
+            try:
+                seen = st.last_reported.timestamp()
+            except Exception:
+                continue
+            if seen > by_domain.get(ent.platform, 0):
+                by_domain[ent.platform] = seen
+        for dom, seen in by_domain.items():
+            if seen >= fresh_cut:
+                out.add(dom)
+    except Exception as err:
+        log.warning(f"config_health: telemetry check failed ({err})")
+    return out
+
+
 def _ops_signature(payload):
     """What has to change before the state machine is written again.
 
@@ -781,8 +832,8 @@ def _ops_signature(payload):
     # left the signature identical, and the corrected document was never
     # published - the page kept showing the old answer with no way to tell.
     return json.dumps([
-        sig(payload["execution"], "fp", "severity", "failures", "safety", "recurring"),
-        sig(payload["integrations"], "fp", "severity", "errors"),
+        sig(payload["execution"], "fp", "status", "failures", "safety"),
+        sig(payload["integrations"], "fp", "status", "errors"),
         sig(payload["system"], "fp", "severity", "detail"),
         payload.get("ignored", 0),
     ], sort_keys=True)
@@ -798,12 +849,30 @@ async def _ops_scan(background=True):
     task.executor(ha_config_scan.save_log_state, fresh_state, _now())
     safety = _safety_automations()
     ignores = task.executor(ha_config_scan.load_ignores)
+    live_exec = _ops_execution(incidents, now_ts, safety)
+    live_integ = _ops_integrations(incidents, now_ts, ignores)
+    system = await _ops_system(now_ts)
+
+    # Fold this scan's evidence into what survived the last restart.
+    store = task.executor(ha_config_scan.load_incidents)
+    restarted = bool(_OPS.pop("restarted", False))
+    pending_domains = set()
+    for rec in store["integrations"].values():
+        if rec.get("status") in ("pending", "critical", "warning") and rec.get("domain"):
+            pending_domains.add(rec["domain"])
+    healthy = _healthy_domains(pending_domains)
+    execution, integrations, store = ha_config_scan.reconcile_incidents(
+        store, live_exec, live_integ, now_ts, restarted, healthy)
+    store["updated"] = _now()
+    task.executor(ha_config_scan.save_incidents, store)
+
     payload = {
         "generated": _now(),
-        "execution": _ops_execution(incidents, now_ts, safety),
-        "integrations": _ops_integrations(incidents, now_ts, ignores),
-        "system": await _ops_system(now_ts),
+        "execution": execution,
+        "integrations": integrations,
+        "system": system,
         "log_records": len(records),
+        "restarted": restarted,
         "ignored": _OPS.get("system_ignored", 0),
         "scan_seconds": round(time.time() - started, 3),
     }
@@ -840,7 +909,9 @@ def _ops_notify(payload, state_store, background):
     reported is never reported twice."""
     findings = []
     for e in payload["execution"]:
-        if e["severity"] != "actionable":
+        # `pending` is deliberately silent. It means nobody has checked since
+        # the restart, which is a thing to show and not a thing to buzz about.
+        if not ha_config_scan.incident_is_live(e.get("status")):
             continue
         findings.append({
             "fp": e["fp"], "severity": "execution", "kind": "execution",
@@ -848,7 +919,7 @@ def _ops_notify(payload, state_store, background):
             "owner_name": e["name"], "owner_type": e["type"],
             "problem": "%d failed action%s, latest %s"
                        % (e["failures"], "" if e["failures"] == 1 else "s",
-                          (e["last"] or "")[11:16]),
+                          (e.get("last") or "")[11:16]),
         })
     for s in payload["system"]:
         if s["severity"] not in ("actionable", "critical"):
@@ -859,7 +930,7 @@ def _ops_notify(payload, state_store, background):
             "owner_type": s["kind"], "problem": s["detail"],
         })
     for i in payload["integrations"]:
-        if i["severity"] != "critical":
+        if not ha_config_scan.incident_is_live(i.get("status")):
             continue
         findings.append({
             "fp": i["fp"], "severity": "system", "kind": "integration",
@@ -1226,6 +1297,9 @@ async def config_health_startup():
     state["grace_until"] = time.strftime(
         "%Y-%m-%d %H:%M:%S", time.localtime(time.time() + STARTUP_GRACE_SECONDS))
     task.executor(ha_config_scan.save_notify_state, state)
+    # The next operational pass must know a restart happened: system_log is
+    # empty, so "no evidence" would otherwise read as "nothing wrong".
+    _OPS["restarted"] = True
     _publish_discovery()
     _run_scan(manual=True)
     await _ops_scan()

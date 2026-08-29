@@ -1035,6 +1035,219 @@ def log_is_noise(name):
     return any(str(name).startswith(p) for p in LOG_IGNORE_PREFIXES)
 
 
+# --- surviving a restart ----------------------------------------------
+#
+# `system_log` is memory. A Home Assistant restart empties it, and every
+# incident derived from it vanishes with it - which is how a camera that had
+# been failing for four days silently became "healthy" the moment Home
+# Assistant was restarted for an unrelated reason, and how a water pump's
+# ninety-four failed shutdowns stopped being on the record.
+#
+# Absence of evidence is not evidence of absence. After a restart there is no
+# evidence either way, and the honest answer is neither "broken" nor "fine"
+# but "this was broken and nobody has checked since". That is what `pending`
+# means below, and it is deliberately not green.
+INCIDENT_FILE = os.path.join(CONFIG_DIR, "config_health_incidents.json")
+
+# How long a quiet incident stays on the page before it is forgotten. Matches
+# the execution retention: an incident from breakfast should still be visible
+# after work, and gone the next day.
+INCIDENT_RETAIN_SECONDS = 24 * 3600
+
+# Consecutive scans of healthy, advancing telemetry before a `pending`
+# integration incident is called recovered. At the five-minute operational
+# cadence three passes is a quarter of an hour of proof, which is enough to
+# distinguish "working again" from "answered once and hung" - the exact
+# failure this system has watched a camera do three times.
+INCIDENT_HEAL_PASSES = 3
+
+
+def load_incidents():
+    """The persisted operational incidents. Never raises."""
+    try:
+        with open(INCIDENT_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {
+        "version": 1,
+        "updated": data.get("updated"),
+        "boot": data.get("boot"),
+        "execution": data.get("execution") if isinstance(data.get("execution"), dict) else {},
+        "integrations": data.get("integrations") if isinstance(data.get("integrations"), dict) else {},
+    }
+
+
+def save_incidents(store):
+    tmp = INCIDENT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(store, fh, indent=1, ensure_ascii=False, sort_keys=True)
+    os.replace(tmp, INCIDENT_FILE)
+    return os.path.getsize(INCIDENT_FILE)
+
+
+# Fields that are allowed to reach the store. Everything else - stack traces,
+# raw log lines, exception bodies, anything an integration chose to put in a
+# message - is dropped rather than filtered, because a deny-list is a promise
+# you cannot keep and this file sits next to the configuration.
+EXEC_PERSIST_KEYS = ("fp", "entity_id", "type", "name", "where", "step", "error",
+                     "failures", "first", "last", "safety", "status", "notified",
+                     "healthy_passes")
+INTEG_PERSIST_KEYS = ("fp", "domain", "entry", "entries", "confidence", "message",
+                      "errors", "first", "last", "severity", "status", "notified",
+                      "healthy_passes")
+
+# One line, not a log. Long enough to say what failed, short enough that no
+# stack trace, URL or token survives being put through it.
+SUMMARY_CAP = 160
+
+_SECRETISH = re.compile(
+    r"(?i)(pass(word|wd)?|secret|token|api[_-]?key|appkey|key|credential|auth"
+    r"|bearer|cookie|session)\s*[=:]\s*\S+")
+
+
+def incident_summary(text):
+    """A one-line, secret-free summary of an error.
+
+    Anything that looks like a credential is removed rather than truncated
+    around, and the result is capped hard. This is the only free text that
+    reaches the store.
+    """
+    if not text:
+        return ""
+    one = " ".join(str(text).split())
+    one = _SECRETISH.sub(lambda m: m.group(0).split("=")[0].split(":")[0] + "=<redacted>", one)
+    return one[:SUMMARY_CAP]
+
+
+def _persist_only(record, keys):
+    out = {}
+    for k in keys:
+        if k in record:
+            out[k] = record[k]
+    for k in ("error", "message"):
+        if k in out:
+            out[k] = incident_summary(out[k])
+    return out
+
+
+def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
+                        healthy_domains=None,
+                        retain=INCIDENT_RETAIN_SECONDS,
+                        heal_passes=INCIDENT_HEAL_PASSES):
+    """Fold this scan's evidence into the persisted incidents.
+
+    Returns (execution, integrations, store) where the two lists are what the
+    page should show - live findings first, then whatever the store still
+    remembers.
+
+    The rules:
+
+      - an incident with live evidence is updated and marked verified; its
+        status comes from the live severity
+      - an incident with no live evidence is NOT deleted. If Home Assistant
+        restarted since it was last seen, it becomes `pending`: it was real,
+        and nothing has checked since. Otherwise it is `recovered`
+      - a `pending` integration incident recovers only on evidence - several
+        consecutive scans where that integration is actually producing fresh
+        telemetry - never on silence alone
+      - anything quiet for longer than the retention window is forgotten
+      - `notified` is carried across, so a restart cannot make the phone
+        repeat itself
+    """
+    healthy_domains = healthy_domains or set()
+    execution, integrations = [], {}
+
+    # --- execution -----------------------------------------------------
+    keep_exec = {}
+    live_by_fp = {}
+    for item in live_exec:
+        live_by_fp[item["fp"]] = item
+    for fp, item in live_by_fp.items():
+        prev = store["execution"].get(fp) or {}
+        rec = _persist_only(item, EXEC_PERSIST_KEYS)
+        # The first sighting the store ever had wins, so a restart cannot make
+        # a long incident look like it started this morning.
+        if prev.get("first") and (not rec.get("first") or prev["first"] < rec["first"]):
+            rec["first"] = prev["first"]
+        if prev.get("failures") and item.get("status") != "actionable":
+            rec["failures"] = max(int(prev.get("failures") or 0), int(rec.get("failures") or 0))
+        rec["notified"] = prev.get("notified")
+        rec["healthy_passes"] = 0
+        keep_exec[fp] = rec
+        execution.append(dict(rec, verified=True))
+    for fp, prev in store["execution"].items():
+        if fp in live_by_fp:
+            continue
+        last = _epoch(prev.get("last")) or 0
+        if now_ts - last > retain:
+            continue  # forgotten, normally
+        rec = dict(prev)
+        rec["status"] = "pending" if restarted and prev.get("status") == "actionable" else "recovered"
+        keep_exec[fp] = rec
+        execution.append(dict(rec, verified=False))
+
+    # --- integrations --------------------------------------------------
+    keep_integ = {}
+    for item in live_integ:
+        fp = item["fp"]
+        prev = store["integrations"].get(fp) or {}
+        rec = _persist_only(item, INTEG_PERSIST_KEYS)
+        if prev.get("first") and (not rec.get("first") or prev["first"] < rec["first"]):
+            rec["first"] = prev["first"]
+        rec["errors"] = max(int(prev.get("errors") or 0), int(rec.get("errors") or 0))
+        rec["notified"] = prev.get("notified")
+        rec["healthy_passes"] = 0
+        rec["status"] = item.get("severity")
+        keep_integ[fp] = rec
+        integrations[fp] = dict(rec, verified=True)
+    for fp, prev in store["integrations"].items():
+        if fp in keep_integ:
+            continue
+        last = _epoch(prev.get("last")) or 0
+        if now_ts - last > retain:
+            continue
+        rec = dict(prev)
+        was_bad = prev.get("status") in ("critical", "warning", "pending")
+        if restarted and was_bad:
+            rec["status"] = "pending"
+            rec["healthy_passes"] = 0
+        elif prev.get("status") == "pending":
+            # Only real telemetry gets it out of pending.
+            if prev.get("domain") in healthy_domains:
+                passes = int(prev.get("healthy_passes") or 0) + 1
+                rec["healthy_passes"] = passes
+                if passes >= heal_passes:
+                    rec["status"] = "recovered"
+            else:
+                rec["healthy_passes"] = 0
+        else:
+            rec["status"] = "recovered"
+        keep_integ[fp] = rec
+        integrations[fp] = dict(rec, verified=False)
+
+    store["execution"] = keep_exec
+    store["integrations"] = keep_integ
+    order = {"actionable": 0, "critical": 0, "pending": 1, "warning": 2, "recovered": 3}
+    execution.sort(key=lambda x: (order.get(x.get("status"), 4), -(int(x.get("failures") or 0))))
+    integ_list = sorted(integrations.values(),
+                        key=lambda x: (order.get(x.get("status"), 4), -(int(x.get("errors") or 0))))
+    return execution, integ_list, store
+
+
+def incident_is_live(status):
+    """Statuses that mean "happening now", as opposed to remembered."""
+    return status in ("actionable", "critical")
+
+
+def incident_is_open(status):
+    """Statuses that must not read as healthy. `pending` is here on purpose:
+    a problem nobody has re-checked is not a problem that went away."""
+    return status in ("actionable", "critical", "warning", "pending")
+
+
 # --- execution errors -------------------------------------------------
 
 def parse_execution(inc):
