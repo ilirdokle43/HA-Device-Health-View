@@ -813,8 +813,26 @@ def _evidence_paths(domains, store):
             st = hass.states.get(ent.entity_id)
             if st is None:
                 continue
+            # `st.last_reported` is read through as_dict(), not off the
+            # attribute, because on this Home Assistant the attribute and
+            # `last_reported_timestamp` both hand back the time of the call
+            # rather than the time of the write - identical to the
+            # microsecond for every entity asked in one pass:
+            #
+            #   .last_reported          18:39:58.763330   (all seven alike)
+            #   .as_dict()              18:35:10.221002   (agrees with the
+            #   .as_dict_json           18:35:10.221002    websocket)
+            #
+            # Fed the attribute, this function reported every integration as
+            # one perfectly synchronised group that had just written, so
+            # nothing could ever look stale and a frozen coordinator read as
+            # healthy on every pass.
             try:
-                stamps.setdefault(ent.platform, {})[ent.entity_id] = st.last_reported.isoformat()
+                raw = st.as_dict().get("last_reported")
+                if raw is None:
+                    continue
+                stamps.setdefault(ent.platform, {})[ent.entity_id] = (
+                    raw.isoformat() if hasattr(raw, "isoformat") else str(raw))
             except Exception:
                 continue
         for domain, entity_stamps in stamps.items():
