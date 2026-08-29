@@ -57,7 +57,11 @@
 (function () {
   'use strict';
 
-  const CARD_VERSION = '2026.8.25.4';
+  /* Bumped with every release. `tools/tests.js` refuses to pass unless this
+     matches the newest CHANGELOG heading: a banner that lies about which
+     build is loaded is worse than no banner, because a stale page and an
+     up-to-date one then look identical. */
+  const CARD_VERSION = '2026.8.29';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -2319,6 +2323,12 @@
        a reference to an entity that has actually been deleted is a broken
        configuration whether or not the device is skipped. */
     const skipped = skippedDevices(hass, cfg);
+    /* The label can sit on a single entity as well as on its device, and the
+       backend has always honoured both. One printer entity that reports
+       nonsense while the rest of the machine is fine is a reasonable thing to
+       silence on its own. */
+    const skipLabel = (cfg && cfg.skip_label) || DEFAULT_SKIP_LABEL;
+    const registry = hass.entities || {};
     if (!config.depIndex) config.depIndex = buildDependencyIndex(config.items);
 
     const touched = new Set();
@@ -2369,7 +2379,11 @@
          automation cannot run" to "because that device is offline" without
          holding both halves of the page in their head. */
       const dev = deviceIndex ? deviceIndex.get(entityId) : null;
-      if (confidence !== 'verified' && dev && skipped.has(dev.deviceId)) continue;
+      if (confidence !== 'verified') {
+        const own = (registry[entityId] && registry[entityId].labels) || null;
+        if (dev && skipped.has(dev.deviceId)) continue;
+        if (own && own.indexOf(skipLabel) >= 0) continue;
+      }
       for (const item of items) {
         item.issues.push({
           confidence,

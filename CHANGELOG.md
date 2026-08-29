@@ -4,6 +4,30 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.29
+
+### Fixed
+
+- **The version banner told the truth about the wrong build.** `CARD_VERSION` had not been
+  bumped in four releases, so the line the card prints to the console named a build from
+  three days earlier. A page still running an older bundle and a freshly updated one
+  therefore looked identical, which is exactly the case the banner exists to tell apart.
+  A test now refuses to pass unless the constant matches the newest heading in this file.
+
+### Changed
+
+- **Skip can sit on a single entity, not only on its device.** The backend has always
+  honoured a `skip_health_checks` label on either; the card only looked at the device. One
+  sensor that reports nonsense while the rest of the machine is fine can now be silenced on
+  its own. As before, only the runtime verdicts go quiet - a reference to an entity that has
+  actually been deleted is still broken.
+
+### Internal
+
+- The offline harness dropped registry labels when it rebuilt `hass` from a dump, so no tool
+  or test built from real data could see skip at all: they reported findings for devices the
+  browser hides. Labels now survive on both devices and entities.
+
 ## 2026.8.28.3
 
 ### Fixed
