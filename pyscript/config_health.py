@@ -652,7 +652,7 @@ def _ops_execution(incidents, now_ts, safety):
     return out[:OPS_LIST_CAP]
 
 
-def _ops_integrations(incidents, now_ts):
+def _ops_integrations(incidents, now_ts, ignores=None):
     """Integrations throwing repeatedly behind a config entry that still
     claims to be loaded - the Tapo camera class, where nothing else in Home
     Assistant says anything is wrong."""
@@ -670,6 +670,8 @@ def _ops_integrations(incidents, now_ts):
         if sev == "quiet":
             continue
         titles = _entry_titles(domain)
+        if ha_config_scan.is_ignored(ignores, "integration", domain, "integ:" + domain, []):
+            continue
         out.append({
             "domain": domain,
             "confidence": confidence,
@@ -691,12 +693,19 @@ def _ops_integrations(incidents, now_ts):
 
 
 async def _ops_system(now_ts):
-    """The house's own machinery: add-ons, backups, repairs, supervisor."""
+    """The house's own machinery: add-ons, backups, repairs, supervisor.
+
+    Every finding carries a `kind` and a `ref` so the ignore rules that
+    already govern the configuration findings govern these too. An add-on
+    that stops itself by design - a one-shot installer set to start on boot -
+    is a true finding by the rule and a nuisance on the page, and that is
+    exactly what the ignore list is for.
+    """
     out = []
     for f in ha_config_scan.addon_findings(_addons()):
         out.append({
             "kind": "addon", "name": f["name"], "detail": f["message"],
-            "severity": f["severity"], "state": f["state"],
+            "severity": f["severity"], "state": f["state"], "ref": f["slug"],
             "url": "/hassio/addon/" + f["slug"] + "/info",
             "fp": "addon:" + f["slug"],
         })
@@ -704,7 +713,7 @@ async def _ops_system(now_ts):
     b = ha_config_scan.backup_finding(success, attempt, now_ts)
     if b:
         out.append({
-            "kind": "backup", "name": "Backup", "detail": b["message"],
+            "kind": "backup", "name": "Backup", "detail": b["message"], "ref": "backup",
             "severity": b["severity"], "url": "/config/backup",
             "fp": "backup",
         })
@@ -712,7 +721,7 @@ async def _ops_system(now_ts):
     if issues:
         worst = "actionable" if any([i["severity"] == "critical" for i in issues]) else "warning"
         out.append({
-            "kind": "repairs", "name": "Home Assistant Repairs",
+            "kind": "repairs", "ref": "repairs", "name": "Home Assistant Repairs",
             "detail": "%d active issue%s" % (len(issues), "" if len(issues) == 1 else "s"),
             "severity": worst, "url": "/config/repairs", "count": len(issues),
             "items": [i["domain"] + ": " + (i["translation_key"] or i["issue_id"])[:60]
@@ -732,13 +741,22 @@ async def _ops_system(now_ts):
                 # automatic backups are partial (core, add-ons and ssl) while
                 # the supervisor's check only counts full backups, so it can
                 # never clear on its own and must not be allowed to shout.
-                "kind": "supervisor", "name": "Supervisor",
+                "kind": "supervisor", "ref": "supervisor", "name": "Supervisor",
                 "detail": ", ".join(bits) or "reported an issue",
                 "severity": "critical" if unhealthy else "warning",
                 "url": "/config/hardware", "count": len(sup_issues),
                 "items": bits[:6], "fp": "supervisor",
             })
-    return out
+    ignores = task.executor(ha_config_scan.load_ignores)
+    kept = []
+    hidden = 0
+    for f in out:
+        if ha_config_scan.is_ignored(ignores, f["kind"], f.get("ref"), f["fp"], []):
+            hidden += 1
+            continue
+        kept.append(f)
+    _OPS["system_ignored"] = hidden
+    return kept
 
 
 def _stamp(epoch):
@@ -758,10 +776,15 @@ def _ops_signature(payload):
     """
     def sig(items, *keys):
         return [[str(i.get(k)) for k in keys] for i in items]
+    # Every field the page actually renders has to be in here. `safety` was
+    # not, so labelling an automation safety-critical changed the payload,
+    # left the signature identical, and the corrected document was never
+    # published - the page kept showing the old answer with no way to tell.
     return json.dumps([
-        sig(payload["execution"], "fp", "severity", "failures"),
-        sig(payload["integrations"], "fp", "severity"),
+        sig(payload["execution"], "fp", "severity", "failures", "safety", "recurring"),
+        sig(payload["integrations"], "fp", "severity", "errors"),
         sig(payload["system"], "fp", "severity", "detail"),
+        payload.get("ignored", 0),
     ], sort_keys=True)
 
 
@@ -774,12 +797,14 @@ async def _ops_scan(background=True):
     incidents, fresh_state = ha_config_scan.fold_log_window(records, prev, now_ts)
     task.executor(ha_config_scan.save_log_state, fresh_state, _now())
     safety = _safety_automations()
+    ignores = task.executor(ha_config_scan.load_ignores)
     payload = {
         "generated": _now(),
         "execution": _ops_execution(incidents, now_ts, safety),
-        "integrations": _ops_integrations(incidents, now_ts),
+        "integrations": _ops_integrations(incidents, now_ts, ignores),
         "system": await _ops_system(now_ts),
         "log_records": len(records),
+        "ignored": _OPS.get("system_ignored", 0),
         "scan_seconds": round(time.time() - started, 3),
     }
     _OPS["payload"] = payload
@@ -801,6 +826,7 @@ async def _ops_scan(background=True):
                 "integrations": payload["integrations"],
                 "system": payload["system"],
                 "log_records": payload["log_records"],
+                "ignored": payload["ignored"],
                 "scan_seconds": payload["scan_seconds"],
             },
         )
