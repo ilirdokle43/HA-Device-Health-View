@@ -677,10 +677,12 @@ def _ops_integrations(incidents, now_ts, ignores=None):
         domain, confidence = ha_config_scan.integration_of(inc)
         if not domain:
             continue
-        sev = ha_config_scan.integration_severity(
+        # Every error is folded in, even a single one. It arrives as
+        # `evidence` - remembered, never shown, never notified - because a
+        # record dropped here can never accumulate across a restart, and that
+        # is exactly how a camera failing every ten minutes stayed invisible.
+        sev = ha_config_scan.integration_status(
             inc["recent"], inc["last"], inc["first"], now_ts, inc["count"])
-        if sev == "quiet":
-            continue
         titles = _entry_titles(domain)
         if ha_config_scan.is_ignored(ignores, "integration", domain, "integ:" + domain, []):
             continue

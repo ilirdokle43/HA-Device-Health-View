@@ -1395,6 +1395,24 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
     return execution, integ_list, store
 
 
+def integration_status(recent, last_ts, first_ts, now_ts, count=None,
+                       actionable=INTEG_ACTIONABLE):
+    """The status a live log record should be folded in at.
+
+    `integration_severity` answers "is this worth reporting", and the answer
+    for a single error is no. But "not worth reporting" is not the same as
+    "not worth remembering": system_log is memory and also evicts, so an
+    error that is discarded here can never accumulate, and
+    error-restart-error-restart-error looks like three clean boots forever.
+
+    So a quiet record becomes `evidence` - persisted, invisible, silent -
+    rather than being dropped. This wrapper exists so that distinction is
+    testable without a running Home Assistant.
+    """
+    sev = integration_severity(recent, last_ts, first_ts, now_ts, count, actionable)
+    return "evidence" if sev == "quiet" else sev
+
+
 def incident_is_live(status):
     """Statuses that mean "happening now", as opposed to remembered."""
     return status in ("actionable", "critical")
