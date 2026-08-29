@@ -4,6 +4,36 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.29.4
+
+### Fixed
+
+- **Recovery is judged on the path that failed.** The previous check asked whether the *newest*
+  entity of an integration was fresh, and a camera disproved it: when the TP-Link coordinator
+  hangs, six entities freeze together while the live-view stream carries on, so the newest
+  entity is the one thing that never broke - and a pending incident would have cleared on it.
+  The evidence path is now the group of entities the coordinator writes **together**, found
+  from shared `last_reported` timestamps rather than any hardcoded list, refined by
+  intersection over successive passes. Recovery needs that group to advance on three
+  consecutive passes; silence never counts and neither does an unrelated entity.
+- **A known-broken integration no longer waits two hours to be reported.** Where an integration
+  already has error evidence *and* its coordinator path has stopped moving - having previously
+  demonstrated a cadence faster than the operational pass - the existing incident escalates.
+  Cadence is learned from observation over a twelve-pass window, never assumed, and a
+  transient error on a genuinely slow integration can never escalate because it never
+  demonstrated speed. This is an extra line of evidence for the existing detector, not a stale
+  telemetry monitor.
+- **Every observed error is persisted immediately as evidence.** `system_log` is memory and
+  also evicts: error-restart-error-restart-error used to look like three clean boots, and an
+  incident could never form. Evidence accumulates under a stable `integ:<domain>` fingerprint
+  with first seen, last seen and a cumulative count. Evidence is remembered, never displayed
+  as a finding and never notified, until it meets the actionable rule.
+- **Repeated restarts no longer leak through the unstable-device mask.** Fixed one-minute
+  buckets had an edge - thirty devices dropping at :59 and forty at :00 is one restart and two
+  buckets, neither reaching the threshold - and four restarts in twenty minutes found it. The
+  mass-drop window slides now, the backend records real restart timestamps for the card to
+  mask against, and overlapping windows merge so no unmasked slivers remain between them.
+
 ## 2026.8.29.3
 
 ### Fixed

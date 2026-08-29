@@ -1097,7 +1097,8 @@ EXEC_PERSIST_KEYS = ("fp", "entity_id", "type", "name", "where", "step", "error"
                      "healthy_passes")
 INTEG_PERSIST_KEYS = ("fp", "domain", "entry", "entries", "confidence", "message",
                       "errors", "first", "last", "severity", "status", "notified",
-                      "healthy_passes")
+                      "healthy_passes", "observed", "seen", "evidence",
+                      "evidence_stamp", "cadence", "reason")
 
 # One line, not a log. Long enough to say what failed, short enough that no
 # stack trace, URL or token survives being put through it.
@@ -1133,31 +1134,145 @@ def _persist_only(record, keys):
     return out
 
 
+# --- the evidence path ------------------------------------------------
+#
+# An integration must be judged healthy on the same data path that failed.
+#
+# The first version of this asked "is the newest entity of this integration
+# fresh?", and a camera taught it better. When the TP-Link coordinator hangs,
+# five switches and a signal sensor freeze together while
+# `camera.…_live_view` carries on updating from its own stream: the newest
+# entity is two minutes old and everything that actually broke is twenty.
+# "Newest" would have called that recovered.
+#
+# So recovery evidence is the group of entities the coordinator writes
+# TOGETHER. Home Assistant does not publish coordinator membership, but it
+# does not need to: a coordinator writes all its entities in one pass, so
+# they share a `last_reported` timestamp to the microsecond. Entities on
+# their own schedule never do.
+
+# An evidence group has to be at least this big before shared timestamps mean
+# anything. Two entities agreeing by chance is possible; it is also harmless,
+# because the group is refined by intersection over successive passes.
+EVIDENCE_MIN_GROUP = 2
+
+# How many passes of cadence history to keep. Twelve at the five-minute
+# operational cadence is an hour - long enough to establish a habit, short
+# enough to notice when one changes.
+CADENCE_WINDOW = 12
+
+# Of those, how many must have advanced before the integration counts as
+# having demonstrated a cadence faster than the operational pass.
+CADENCE_FAST_RATIO = 0.8
+
+# How many missed observation intervals make a demonstrated-fast evidence
+# group abnormally stale. Three passes is fifteen minutes: far outside any
+# cadence that was advancing on four passes out of five, and comfortably
+# outside a single slow poll.
+STALE_INTERVALS = 3
+
+
+def evidence_group(entity_stamps, previous=None):
+    """The entities an integration's coordinator writes together.
+
+    `entity_stamps` is {entity_id: last_reported string}. Returns
+    (entity_ids, shared_stamp) for the largest set sharing one timestamp, or
+    the single entity when the integration only has one.
+
+    `previous` is the group remembered from earlier passes. The new group is
+    intersected with it, which is what makes this converge: immediately after
+    a restart every entity of an integration shares the startup timestamp, so
+    the first observation over-collects. On the next pass the coordinator
+    entities still share their own (possibly stale) stamp while the
+    independent ones have moved on, and the intersection drops them.
+    """
+    if not entity_stamps:
+        return [], None
+    by_stamp = {}
+    for entity_id, stamp in entity_stamps.items():
+        if not stamp:
+            continue
+        by_stamp.setdefault(stamp, []).append(entity_id)
+    if not by_stamp:
+        return [], None
+    groups = sorted(by_stamp.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    stamp, members = groups[0]
+    if len(members) < EVIDENCE_MIN_GROUP:
+        # A single-entity integration is its own evidence. Nothing to
+        # cross-check it against, but it is still the right path to watch.
+        if len(entity_stamps) == 1:
+            only = sorted(entity_stamps)[0]
+            return [only], entity_stamps[only]
+        return [], None
+    members = sorted(members)
+    if previous:
+        keep = sorted(set(members) & set(previous))
+        if keep:
+            # The remembered group still exists; narrow to it and report the
+            # stamp those members actually share.
+            stamps = set(entity_stamps.get(e) for e in keep)
+            return keep, (sorted(stamps)[-1] if stamps else stamp)
+    return members, stamp
+
+
+def cadence_note(history, advanced, window=CADENCE_WINDOW):
+    """Append one observation to the cadence history, oldest dropped."""
+    hist = [1 if x else 0 for x in (history or [])]
+    hist.append(1 if advanced else 0)
+    return hist[-window:]
+
+
+def cadence_is_fast(history, window=CADENCE_WINDOW, ratio=CADENCE_FAST_RATIO):
+    """Has this evidence group demonstrated a cadence faster than the pass?
+
+    Only a full window counts. An integration that has been watched three
+    times has not demonstrated anything, and letting a short history qualify
+    is how a slow integration would get escalated on its first quiet spell.
+    """
+    hist = [1 if x else 0 for x in (history or [])]
+    if len(hist) < window:
+        return False
+    return (sum(hist) / float(len(hist))) >= ratio
+
+
+def evidence_is_stale(stamp_ts, now_ts, interval_seconds, intervals=STALE_INTERVALS):
+    """Is the evidence group abnormally stale for something this fast?"""
+    if stamp_ts is None:
+        return False
+    return (now_ts - stamp_ts) >= (intervals * interval_seconds)
+
+
 def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
-                        healthy_domains=None,
+                        evidence=None, interval_seconds=300,
                         retain=INCIDENT_RETAIN_SECONDS,
                         heal_passes=INCIDENT_HEAL_PASSES):
     """Fold this scan's evidence into the persisted incidents.
 
-    Returns (execution, integrations, store) where the two lists are what the
-    page should show - live findings first, then whatever the store still
-    remembers.
+    `evidence` is {domain: {"entities": [...], "stamp": iso, "stamp_ts": float}}
+    describing the coordinator path for each integration we are watching -
+    see `evidence_group`. It is what recovery and staleness are judged on,
+    never the newest entity the integration happens to own.
+
+    Returns (execution, integrations, store).
 
     The rules:
 
-      - an incident with live evidence is updated and marked verified; its
-        status comes from the live severity
-      - an incident with no live evidence is NOT deleted. If Home Assistant
-        restarted since it was last seen, it becomes `pending`: it was real,
+      - every observed error contributes to the persisted record immediately,
+        at status `evidence`. That is not a finding and never notifies; it
+        exists so that error-restart-error-restart-error accumulates into one
+        incident instead of looking like three clean boots
+      - an incident with live evidence is updated; its status comes from the
+        live severity, or from the staleness clause below
+      - an incident with no live evidence is not deleted. If Home Assistant
+        restarted since it was last seen it becomes `pending` - it was real,
         and nothing has checked since. Otherwise it is `recovered`
-      - a `pending` integration incident recovers only on evidence - several
-        consecutive scans where that integration is actually producing fresh
-        telemetry - never on silence alone
-      - anything quiet for longer than the retention window is forgotten
-      - `notified` is carried across, so a restart cannot make the phone
-        repeat itself
+      - a `pending` integration recovers only on its own coordinator path
+        advancing, on `heal_passes` consecutive passes. Silence never counts,
+        and neither does an unrelated entity of the same integration
+      - anything quiet beyond the retention window is forgotten
+      - `notified` is carried across, so a restart cannot repeat a push
     """
-    healthy_domains = healthy_domains or set()
+    evidence = evidence or {}
     execution, integrations = [], {}
 
     # --- execution -----------------------------------------------------
@@ -1168,8 +1283,6 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
     for fp, item in live_by_fp.items():
         prev = store["execution"].get(fp) or {}
         rec = _persist_only(item, EXEC_PERSIST_KEYS)
-        # The first sighting the store ever had wins, so a restart cannot make
-        # a long incident look like it started this morning.
         if prev.get("first") and (not rec.get("first") or prev["first"] < rec["first"]):
             rec["first"] = prev["first"]
         if prev.get("failures") and item.get("status") != "actionable":
@@ -1183,7 +1296,7 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
             continue
         last = _epoch(prev.get("last")) or 0
         if now_ts - last > retain:
-            continue  # forgotten, normally
+            continue
         rec = dict(prev)
         rec["status"] = "pending" if restarted and prev.get("status") == "actionable" else "recovered"
         keep_exec[fp] = rec
@@ -1191,18 +1304,30 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
 
     # --- integrations --------------------------------------------------
     keep_integ = {}
+    seen_live = set()
     for item in live_integ:
         fp = item["fp"]
+        seen_live.add(fp)
         prev = store["integrations"].get(fp) or {}
         rec = _persist_only(item, INTEG_PERSIST_KEYS)
+        for key in ("evidence", "evidence_stamp", "cadence"):
+            if key in prev:
+                rec[key] = prev[key]
         if prev.get("first") and (not rec.get("first") or prev["first"] < rec["first"]):
             rec["first"] = prev["first"]
-        rec["errors"] = max(int(prev.get("errors") or 0), int(rec.get("errors") or 0))
+        # Cumulative across restarts: system_log's counter resets, this does
+        # not. `observed` is the number this incident has ever been credited
+        # with, and it only ever grows while the incident lives.
+        seen_now = int(rec.get("errors") or 0)
+        prev_seen = int(prev.get("seen") or 0)
+        rec["observed"] = int(prev.get("observed") or 0) + max(0, seen_now - prev_seen) \
+            if seen_now >= prev_seen else int(prev.get("observed") or 0) + seen_now
+        rec["seen"] = seen_now
+        rec["errors"] = max(rec["observed"], seen_now)
         rec["notified"] = prev.get("notified")
-        rec["healthy_passes"] = 0
         rec["status"] = item.get("severity")
         keep_integ[fp] = rec
-        integrations[fp] = dict(rec, verified=True)
+    # Records with no live errors this pass still get their evidence updated.
     for fp, prev in store["integrations"].items():
         if fp in keep_integ:
             continue
@@ -1210,30 +1335,63 @@ def reconcile_incidents(store, live_exec, live_integ, now_ts, restarted,
         if now_ts - last > retain:
             continue
         rec = dict(prev)
-        was_bad = prev.get("status") in ("critical", "warning", "pending")
-        if restarted and was_bad:
+        rec["seen"] = 0  # system_log no longer carries it; cumulative stands
+        was_open = prev.get("status") in ("critical", "warning", "pending")
+        if restarted and was_open:
             rec["status"] = "pending"
             rec["healthy_passes"] = 0
-        elif prev.get("status") == "pending":
-            # Only real telemetry gets it out of pending.
-            if prev.get("domain") in healthy_domains:
-                passes = int(prev.get("healthy_passes") or 0) + 1
-                rec["healthy_passes"] = passes
-                if passes >= heal_passes:
-                    rec["status"] = "recovered"
-            else:
-                rec["healthy_passes"] = 0
+        elif prev.get("status") in ("pending", "evidence"):
+            rec["status"] = prev.get("status")
         else:
             rec["status"] = "recovered"
         keep_integ[fp] = rec
-        integrations[fp] = dict(rec, verified=False)
+
+    # --- evidence path: recovery, and the staleness clause -------------
+    for fp, rec in keep_integ.items():
+        ev = evidence.get(rec.get("domain")) or {}
+        members = ev.get("entities") or []
+        stamp = ev.get("stamp")
+        stamp_ts = ev.get("stamp_ts")
+        if members:
+            rec["evidence"] = members
+        advanced = bool(stamp and rec.get("evidence_stamp") and stamp != rec["evidence_stamp"])
+        if stamp:
+            rec["evidence_stamp"] = stamp
+        # Cadence is only observed while we have a path to observe.
+        if members:
+            rec["cadence"] = cadence_note(rec.get("cadence"), advanced)
+        fast = cadence_is_fast(rec.get("cadence"))
+        stale = evidence_is_stale(stamp_ts, now_ts, interval_seconds)
+
+        if rec.get("status") == "pending":
+            if advanced and not stale:
+                rec["healthy_passes"] = int(rec.get("healthy_passes") or 0) + 1
+                if rec["healthy_passes"] >= heal_passes:
+                    rec["status"] = "recovered"
+            else:
+                rec["healthy_passes"] = 0
+        elif rec.get("status") in ("evidence", "warning"):
+            # The scoped clause. An integration that has thrown errors and
+            # whose own coordinator path has stopped moving - when that path
+            # has demonstrably been moving faster than we sample - is failing
+            # now, whatever the error counter says. This is the difference
+            # between noticing a hung camera in fifteen minutes and noticing
+            # it in two hours.
+            if fast and stale and _epoch(rec.get("last")) and \
+                    (now_ts - _epoch(rec["last"])) <= retain:
+                rec["status"] = "critical"
+                rec["reason"] = "coordinator path stale"
+
+    for fp, rec in keep_integ.items():
+        integrations[fp] = dict(rec, verified=fp in seen_live)
 
     store["execution"] = keep_exec
     store["integrations"] = keep_integ
-    order = {"actionable": 0, "critical": 0, "pending": 1, "warning": 2, "recovered": 3}
-    execution.sort(key=lambda x: (order.get(x.get("status"), 4), -(int(x.get("failures") or 0))))
+    order = {"actionable": 0, "critical": 0, "pending": 1, "warning": 2,
+             "evidence": 3, "recovered": 4}
+    execution.sort(key=lambda x: (order.get(x.get("status"), 5), -(int(x.get("failures") or 0))))
     integ_list = sorted(integrations.values(),
-                        key=lambda x: (order.get(x.get("status"), 4), -(int(x.get("errors") or 0))))
+                        key=lambda x: (order.get(x.get("status"), 5), -(int(x.get("errors") or 0))))
     return execution, integ_list, store
 
 
@@ -1244,8 +1402,18 @@ def incident_is_live(status):
 
 def incident_is_open(status):
     """Statuses that must not read as healthy. `pending` is here on purpose:
-    a problem nobody has re-checked is not a problem that went away."""
+    a problem nobody has re-checked is not a problem that went away.
+
+    `evidence` is deliberately absent. A single error is remembered so it can
+    accumulate across restarts, but one error is not a finding and showing it
+    as one would fill the page with noise the moment anything hiccuped.
+    """
     return status in ("actionable", "critical", "warning", "pending")
+
+
+def incident_is_evidence(status):
+    """Remembered, below the reporting bar, and silent."""
+    return status == "evidence"
 
 
 # --- execution errors -------------------------------------------------

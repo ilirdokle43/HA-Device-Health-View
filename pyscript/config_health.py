@@ -467,6 +467,11 @@ def _notify_pass(findings, background, state):
 
 OPS_ENTITY = "pyscript.config_health_ops"
 
+# The operational pass runs on this beat. Cadence learning and the staleness
+# clause are both expressed in multiples of it rather than in absolute
+# seconds, so changing the cron changes them together.
+OPS_INTERVAL_SECONDS = 300
+
 # The label that marks an automation as safety-critical, where one failed
 # attempt is already the whole story. It is read from the entity registry and
 # never inferred: an automation is safety-critical because someone said so,
@@ -779,42 +784,78 @@ def _stamp(epoch):
         return None
 
 
-def _healthy_domains(pending_domains):
-    """Which of these integrations are demonstrably alive right now.
+def _evidence_paths(domains, store):
+    """The coordinator path for each integration we are watching.
 
-    Scoped deliberately: this is not stale-telemetry detection over the whole
-    house, it is the single question "has this specific integration, which we
-    know was failing, actually started answering again". An integration whose
-    newest entity reported within the last ten minutes is answering. One whose
-    entities are all frozen is not - which is exactly the state a hung camera
-    sits in while its log stays silent.
+    Returns {domain: {entities, stamp, stamp_ts}}. The group is worked out
+    from shared `last_reported` timestamps rather than from any list of
+    entity names - Home Assistant does not publish coordinator membership,
+    but a coordinator writes all of its entities in one pass, so they agree
+    to the microsecond and entities on their own schedule do not.
+
+    This replaces asking "is the newest entity of this integration fresh?",
+    which a camera disproved: when the TP-Link coordinator hangs, six
+    entities freeze together while the live-view stream carries on, and the
+    newest entity is the one thing that never broke.
     """
-    out = set()
-    if not pending_domains:
+    out = {}
+    if not domains:
         return out
     try:
         from homeassistant.helpers import entity_registry
         ereg = entity_registry.async_get(hass)
-        fresh_cut = time.time() - 600
-        by_domain = {}
+        stamps = {}
         for ent in ereg.entities.values():
-            if ent.platform not in pending_domains or ent.disabled_by:
+            if ent.platform not in domains or ent.disabled_by:
                 continue
             st = hass.states.get(ent.entity_id)
             if st is None:
                 continue
             try:
-                seen = st.last_reported.timestamp()
+                stamps.setdefault(ent.platform, {})[ent.entity_id] = st.last_reported.isoformat()
             except Exception:
                 continue
-            if seen > by_domain.get(ent.platform, 0):
-                by_domain[ent.platform] = seen
-        for dom, seen in by_domain.items():
-            if seen >= fresh_cut:
-                out.add(dom)
+        for domain, entity_stamps in stamps.items():
+            prev = ((store.get("integrations") or {}).get("integ:" + domain) or {}).get("evidence")
+            members, stamp = ha_config_scan.evidence_group(entity_stamps, prev)
+            ts = None
+            if stamp:
+                try:
+                    from homeassistant.util import dt as dt_util
+                    parsed = dt_util.parse_datetime(stamp)
+                    ts = parsed.timestamp() if parsed else None
+                except Exception:
+                    ts = None
+            out[domain] = {"entities": members, "stamp": stamp, "stamp_ts": ts}
     except Exception as err:
-        log.warning(f"config_health: telemetry check failed ({err})")
+        log.warning(f"config_health: evidence path unavailable ({err})")
     return out
+
+
+def _record_restart(store):
+    """Remember when Home Assistant started, for the unstable-device mask.
+
+    The card cannot ask Home Assistant when it last restarted - there is no
+    entity for it and the recorder run table is not exposed - so the backend,
+    which is told directly by its own startup trigger, keeps the list and
+    publishes it. Four restarts inside twenty minutes is what made this
+    necessary: each one drops every device, and one-minute buckets let the
+    drops straddle a boundary and escape the mask.
+    """
+    stamps = [s for s in (store.get("restarts") or []) if isinstance(s, str)]
+    stamps.append(_iso_now())
+    cut = time.time() - 26 * 3600
+    keep = []
+    for s in stamps[-40:]:
+        try:
+            from homeassistant.util import dt as dt_util
+            p = dt_util.parse_datetime(s)
+            if p and p.timestamp() >= cut:
+                keep.append(s)
+        except Exception:
+            continue
+    store["restarts"] = keep
+    return keep
 
 
 def _ops_signature(payload):
@@ -856,13 +897,20 @@ async def _ops_scan(background=True):
     # Fold this scan's evidence into what survived the last restart.
     store = task.executor(ha_config_scan.load_incidents)
     restarted = bool(_OPS.pop("restarted", False))
-    pending_domains = set()
+    if restarted:
+        _record_restart(store)
+    # Every integration we already know something about, plus anything that
+    # threw this pass - those are the only paths worth watching.
+    watched = set()
     for rec in store["integrations"].values():
-        if rec.get("status") in ("pending", "critical", "warning") and rec.get("domain"):
-            pending_domains.add(rec["domain"])
-    healthy = _healthy_domains(pending_domains)
+        if rec.get("domain"):
+            watched.add(rec["domain"])
+    for item in live_integ:
+        if item.get("domain"):
+            watched.add(item["domain"])
+    paths = _evidence_paths(watched, store)
     execution, integrations, store = ha_config_scan.reconcile_incidents(
-        store, live_exec, live_integ, now_ts, restarted, healthy)
+        store, live_exec, live_integ, now_ts, restarted, paths, OPS_INTERVAL_SECONDS)
     store["updated"] = _now()
     task.executor(ha_config_scan.save_incidents, store)
 
@@ -873,6 +921,7 @@ async def _ops_scan(background=True):
         "system": system,
         "log_records": len(records),
         "restarted": restarted,
+        "restarts": store.get("restarts") or [],
         "ignored": _OPS.get("system_ignored", 0),
         "scan_seconds": round(time.time() - started, 3),
     }
@@ -895,6 +944,7 @@ async def _ops_scan(background=True):
                 "integrations": payload["integrations"],
                 "system": payload["system"],
                 "log_records": payload["log_records"],
+                "restarts": payload["restarts"],
                 "ignored": payload["ignored"],
                 "scan_seconds": payload["scan_seconds"],
             },

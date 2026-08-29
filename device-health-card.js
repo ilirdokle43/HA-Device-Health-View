@@ -61,7 +61,7 @@
      matches the newest CHANGELOG heading: a banner that lies about which
      build is loaded is worse than no banner, because a stale page and an
      up-to-date one then look identical. */
-  const CARD_VERSION = '2026.8.29.3';
+  const CARD_VERSION = '2026.8.29.4';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -5234,6 +5234,7 @@
     const a = st.attributes || {};
     return {
       generated: a.generated || null,
+      restarts: Array.isArray(a.restarts) ? a.restarts : [],
       execution: Array.isArray(a.execution) ? a.execution : [],
       integrations: Array.isArray(a.integrations) ? a.integrations : [],
       system: Array.isArray(a.system) ? a.system : [],
@@ -5357,24 +5358,48 @@
       }
     }
 
-    /* Buckets holding a drop from a large fraction of the house at once. */
-    const buckets = new Map();
-    for (const at of drops) {
-      const b = Math.floor(at / UNSTABLE_MASS_BUCKET_MS);
-      buckets.set(b, (buckets.get(b) || 0) + 1);
-    }
+    /* A mass event is a large fraction of the house dropping at once. It
+       used to be counted in fixed one-minute buckets, which has an edge:
+       thirty devices at :59 and forty at :00 is one restart and two buckets,
+       neither of which reaches the threshold. Four restarts inside twenty
+       minutes found that edge and produced a device reported as unstable for
+       transitions that were entirely Home Assistant's. The window slides
+       now, so where the minute boundary falls no longer matters. */
     const sampled = Object.keys(series).length;
     const threshold = Math.max(3, Math.ceil(sampled * UNSTABLE_MASS_RATIO));
+    const sortedDrops = drops.slice().sort((a, b) => a - b);
     const masked = [];
-    for (const [b, n] of buckets) {
+    for (let i = 0; i < sortedDrops.length; i++) {
+      const at = sortedDrops[i];
+      let n = 0;
+      for (let j = i; j < sortedDrops.length && sortedDrops[j] - at <= UNSTABLE_MASS_BUCKET_MS; j++) n++;
       if (n >= threshold) {
-        const centre = b * UNSTABLE_MASS_BUCKET_MS;
-        masked.push([centre - UNSTABLE_MASS_PAD_MS, centre + UNSTABLE_MASS_BUCKET_MS + UNSTABLE_MASS_PAD_MS]);
+        masked.push([at - UNSTABLE_MASS_PAD_MS, at + UNSTABLE_MASS_BUCKET_MS + UNSTABLE_MASS_PAD_MS]);
       }
     }
+    /* Restarts the backend actually recorded. The shape test still runs
+       alongside this, because it catches things that have no restart event
+       at all - a Zigbee coordinator reconnecting takes the mesh down with it
+       and Home Assistant never notices. */
+    for (const iso of (options.restarts || [])) {
+      const at = Date.parse(iso);
+      if (!isNaN(at)) masked.push([at - UNSTABLE_MASS_PAD_MS, at + UNSTABLE_MASS_PAD_MS]);
+    }
     masked.sort((a, b) => a[0] - b[0]);
+    /* Overlapping windows merge. Four restarts a few minutes apart are one
+       disturbed period, and leaving slivers of unmasked time between them is
+       how a device gets charged for the gaps between someone's restarts. */
+    for (let i = masked.length - 1; i > 0; i--) {
+      if (masked[i][0] <= masked[i - 1][1]) {
+        masked[i - 1][1] = Math.max(masked[i - 1][1], masked[i][1]);
+        masked.splice(i, 1);
+      }
+    }
     const inMask = (at) => masked.some((m) => at >= m[0] && at <= m[1]);
-    const maskedMs = masked.reduce((sum, m) => sum + (m[1] - m[0]), 0);
+    /* Merged already, so this cannot double-count overlapping windows - and
+       the denominator has to shrink by exactly the time that was excluded or
+       availability would be charged for it. */
+    const maskedMs = masked.reduce((sum, m) => sum + (Math.min(m[1], now) - Math.max(m[0], start)), 0);
 
     const out = [];
     for (const entityId in series) {
@@ -5524,6 +5549,10 @@
     unstableCache.running = true;
     const probes = unstableProbes(hass);
     const created = unstableCreated(hass);
+    /* Restart stamps the backend recorded. Absent on an install without one,
+       in which case the shape test carries the whole job as before. */
+    const ops = opsModel(hass);
+    const restarts = (ops && Array.isArray(ops.restarts)) ? ops.restarts : [];
     const ids = Object.keys(probes);
     if (!ids.length) {
       unstableCache.running = false;
@@ -5539,7 +5568,7 @@
       no_attributes: true,
       significant_changes_only: false,
     }).then((history) => {
-      const result = computeUnstable(history, probes, now, { created });
+      const result = computeUnstable(history, probes, now, { created, restarts });
       result.queryMs = Math.round((performance.now ? performance.now() : Date.now()) - started);
       result.probes = ids.length;
       unstableCache.running = false;
@@ -5594,7 +5623,11 @@
          quietly vanished from this page. `pending` says what is actually
          true: it was failing, and nothing has checked since. */
       const pending = status === 'pending';
-      if (status === 'recovered') continue;
+      /* `evidence` is remembered, not reported. A single error is kept so it
+         can accumulate across restarts into something meaningful; showing it
+         as a finding would put a red row on the page every time anything
+         hiccuped once. */
+      if (status === 'recovered' || status === 'evidence') continue;
       rows.push({
         kind: 'integration',
         name: i.entry || i.domain,
@@ -5602,7 +5635,9 @@
           ? 'Previous failure · awaiting post-restart validation'
           : i.errors + ' error' + (i.errors === 1 ? '' : 's') +
             (i.entries > 1 ? ' · ' + i.domain + ', entry not identified' : '') +
-            ' · still failing',
+            (i.reason === 'coordinator path stale'
+              ? ' · its data path has stopped updating'
+              : ' · still failing'),
         severity: pending ? 'warning' : status,
         url: '/config/integrations/integration/' + i.domain,
         note: pending ? (i.errors + ' errors up to ' + String(i.last || '').slice(11, 16)) : i.message,
