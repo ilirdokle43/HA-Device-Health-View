@@ -4,6 +4,7 @@ Plain Python (NOT pyscript) so pyscript can call it via task.executor, which
 refuses interpreted functions. Does all filesystem work off the event loop.
 """
 
+import datetime
 import json
 import os
 import re
@@ -1077,6 +1078,11 @@ def load_incidents():
         "boot": data.get("boot"),
         "execution": data.get("execution") if isinstance(data.get("execution"), dict) else {},
         "integrations": data.get("integrations") if isinstance(data.get("integrations"), dict) else {},
+        # Carried explicitly. This dict is rebuilt key by key rather than
+        # copied, so anything not named here is silently dropped on load -
+        # which is exactly what happened to the restart history: it was
+        # written, saved, and thrown away again on the very next pass.
+        "restarts": data.get("restarts") if isinstance(data.get("restarts"), list) else [],
     }
 
 
@@ -1156,6 +1162,12 @@ def _persist_only(record, keys):
 # because the group is refined by intersection over successive passes.
 EVIDENCE_MIN_GROUP = 2
 
+# How far apart two writes can be and still count as one coordinator pass.
+# The observed spread across a six-entity group is ~2 ms; the smallest gap
+# between independently scheduled entities is seconds. 250 ms sits two orders
+# of magnitude clear of both.
+EVIDENCE_TOLERANCE_MS = 250
+
 # How many passes of cadence history to keep. Twelve at the five-minute
 # operational cadence is an hour - long enough to establish a habit, short
 # enough to notice when one changes.
@@ -1172,47 +1184,98 @@ CADENCE_FAST_RATIO = 0.8
 STALE_INTERVALS = 3
 
 
-def evidence_group(entity_stamps, previous=None):
+def _iso_epoch(stamp):
+    """Epoch seconds from an ISO-8601 `last_reported`, or None.
+
+    Separate from `_epoch`, which parses the "%Y-%m-%d %H:%M:%S" form the
+    log records use. Entity timestamps carry microseconds and an offset.
+    """
+    if not stamp:
+        return None
+    try:
+        text = str(stamp).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return None
+
+
+def evidence_group(entity_stamps, previous=None, tolerance_ms=EVIDENCE_TOLERANCE_MS):
     """The entities an integration's coordinator writes together.
 
     `entity_stamps` is {entity_id: last_reported string}. Returns
-    (entity_ids, shared_stamp) for the largest set sharing one timestamp, or
-    the single entity when the integration only has one.
+    (entity_ids, shared_stamp) for the largest set written together, or the
+    single entity when the integration only has one.
 
-    `previous` is the group remembered from earlier passes. The new group is
-    intersected with it, which is what makes this converge: immediately after
-    a restart every entity of an integration shares the startup timestamp, so
-    the first observation over-collects. On the next pass the coordinator
-    entities still share their own (possibly stale) stamp while the
-    independent ones have moved on, and the intersection drops them.
+    Members are found by clustering timestamps within a tolerance, NOT by
+    string equality. The first version of this compared the stamps exactly,
+    on the assumption that a coordinator writing its entities in one pass
+    gives them one timestamp. It does not. Home Assistant stamps each state
+    write as it makes it, so the six entities of a TP-Link camera came back
+
+        ...19.491683  ...19.492881  ...19.493198
+        ...19.493438  ...19.493683  ...19.493912
+
+    - agreeing to about two milliseconds and to nothing at all as strings.
+    Exact matching found no group, so the evidence path was empty for every
+    multi-entity integration, and both recovery and the staleness clause
+    quietly had nothing to work with. The tests all passed the same string
+    to every member and so could never have caught it.
+
+    The tolerance is what separates "written together" from "written on
+    their own schedules", and those two are orders of magnitude apart: a
+    coordinator's writes land inside a few milliseconds, while independent
+    entities are seconds or minutes apart. Anything in that gap works.
     """
     if not entity_stamps:
         return [], None
-    by_stamp = {}
+    parsed = {}
     for entity_id, stamp in entity_stamps.items():
-        if not stamp:
-            continue
-        by_stamp.setdefault(stamp, []).append(entity_id)
-    if not by_stamp:
+        ts = _iso_epoch(stamp)
+        if ts is not None:
+            parsed[entity_id] = ts
+    if not parsed:
         return [], None
-    groups = sorted(by_stamp.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-    stamp, members = groups[0]
-    if len(members) < EVIDENCE_MIN_GROUP:
+
+    # Cluster around each entity in turn and keep the biggest. Anchoring on
+    # real observations rather than on fixed buckets is deliberate: a bucket
+    # boundary falling between two writes would split a group, which is the
+    # same way fixed buckets once let device drops escape the restart mask.
+    tol = float(tolerance_ms) / 1000.0
+    best, best_ts = [], None
+    for anchor_id in sorted(parsed):
+        anchor = parsed[anchor_id]
+        members = sorted([e for e in parsed if abs(parsed[e] - anchor) <= tol])
+        newest = max([parsed[e] for e in members])
+        # Bigger group wins; on a tie the older one does, so a group is not
+        # traded for an equally sized one that merely reported later.
+        if len(members) > len(best) or (len(members) == len(best)
+                                        and best_ts is not None and newest < best_ts):
+            best, best_ts = members, newest
+
+    def _stamp_of(members):
+        newest_id = members[0]
+        for e in members:
+            if parsed[e] > parsed[newest_id]:
+                newest_id = e
+        return entity_stamps[newest_id]
+
+    if len(best) < EVIDENCE_MIN_GROUP:
         # A single-entity integration is its own evidence. Nothing to
         # cross-check it against, but it is still the right path to watch.
-        if len(entity_stamps) == 1:
-            only = sorted(entity_stamps)[0]
+        if len(parsed) == 1:
+            only = sorted(parsed)[0]
             return [only], entity_stamps[only]
         return [], None
-    members = sorted(members)
+
     if previous:
-        keep = sorted(set(members) & set(previous))
+        keep = sorted(set(best) & set(previous))
         if keep:
             # The remembered group still exists; narrow to it and report the
             # stamp those members actually share.
-            stamps = set(entity_stamps.get(e) for e in keep)
-            return keep, (sorted(stamps)[-1] if stamps else stamp)
-    return members, stamp
+            return keep, _stamp_of(keep)
+    return best, _stamp_of(best)
 
 
 def cadence_note(history, advanced, window=CADENCE_WINDOW):
