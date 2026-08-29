@@ -4,6 +4,30 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.29.2
+
+### Fixed
+
+- **Unstable devices knew what happened yesterday but not what time it is.** A flat 24-hour
+  window reported a plug as unstable at five in the afternoon on the strength of an outage
+  that ended at half past eleven that morning. A device that is currently available and has
+  had no genuine transition for **two hours** is now **Recently recovered**: it keeps every
+  figure - availability, disconnect count, time offline - and gains "Stable for 4h 13m", but
+  it is no longer red, no longer active, and cannot reach the main dashboard. It leaves the
+  page when the outage itself ages out of the 24-hour window, not before. A transition masked
+  as a restart never resets the clock, because it was never this device's transition.
+- **A device's first hour is commissioning, not instability.** Pairing a Zigbee plug produces
+  a run of rejoins before it settles - twelve in fifty-seven minutes on the device that
+  prompted this - and every one of them was being counted. Transitions inside the first hour
+  after the device registry created the device are now excluded, along with the downtime.
+  The join time comes from `created_at` on the registry entry, so it is recorded rather than
+  inferred; a device the registry cannot date simply gets no grace.
+- Operational findings honour the ignore rules that already govern the configuration findings,
+  so an add-on that stops itself by design can be silenced.
+- The published operational document is rewritten whenever a field the page renders changes.
+  `safety` was missing from that check, so labelling an automation safety-critical corrected
+  the payload and never reached the page.
+
 ## 2026.8.29.1
 
 ### Added

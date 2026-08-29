@@ -61,7 +61,7 @@
      matches the newest CHANGELOG heading: a banner that lies about which
      build is loaded is worse than no banner, because a stale page and an
      up-to-date one then look identical. */
-  const CARD_VERSION = '2026.8.29.1';
+  const CARD_VERSION = '2026.8.29.2';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -4173,6 +4173,10 @@
        dashboard; one at 96% is not, and neither is a weak radio link. */
     const un = model.unstable;
     if (un && un.devices) {
+      /* Only a device that is unstable NOW. `recovered` is a band of its own,
+         so a bad day that ended two hours ago cannot reach a main dashboard,
+         and neither can an hour of commissioning - those transitions never
+         became a band at all. */
       const bad = un.devices.filter(
         (r) => unstableBand(r) === 'critical' &&
           !(r.deviceId && model.skipped && model.skipped.has(r.deviceId)));
@@ -5268,6 +5272,23 @@
   const UNSTABLE_CRITICAL_AVAILABILITY = 0.80;
   const UNSTABLE_MIN_TRANSITIONS = 4;
   const UNSTABLE_DISCONNECT_ANOMALY = 6;
+  /* How long a device has to have been steady before its bad day stops being
+     a current problem.
+     A flat 24-hour window has no idea what time it is. It reported a plug as
+     unstable at five in the afternoon on the strength of an outage that ended
+     at half past eleven that morning, and a pump plug as unstable because of
+     the hour in which it was being paired. Both were true about the day and
+     false about the house. Two hours is long enough that a device dropping
+     every twenty minutes never escapes, and short enough that a fault fixed
+     over lunch is not still red at bedtime. */
+  const UNSTABLE_QUIET_MS = 2 * 3600 * 1000;
+  /* A device's first hour after it joins is commissioning, not instability.
+     A Zigbee plug being paired rejoins, re-announces and re-reads its way
+     through several transitions before it settles - twelve in the first
+     fifty-seven minutes, on the device that prompted this. The registry
+     records when the device was created, which is the moment it joined, so
+     this needs no guessing from names or entity ids. */
+  const UNSTABLE_COMMISSION_MS = 60 * 60 * 1000;
   /* Long enough that a page open all day is not re-querying, short enough
      that pressing Rescan after fixing something shows the change. */
   const UNSTABLE_TTL_MS = 15 * 60 * 1000;
@@ -5307,8 +5328,12 @@
    * `history` is what `history/history_during_period` returns with
    * `minimal_response`: {entity_id: [{s, lu}, ...]}, `lu` in seconds.
    */
-  function computeUnstable(history, probes, now, windowMs) {
-    const span = windowMs || UNSTABLE_WINDOW_MS;
+  function computeUnstable(history, probes, now, opts) {
+    const options = typeof opts === 'number' ? { windowMs: opts } : (opts || {});
+    const span = options.windowMs || UNSTABLE_WINDOW_MS;
+    /* deviceId -> epoch ms the device joined. Absent for anything the
+       registry has no creation time for, and absence simply means no grace. */
+    const created = options.created || {};
     const start = now - span;
     const series = {};
     const drops = [];
@@ -5352,17 +5377,30 @@
     const out = [];
     for (const entityId in series) {
       const points = series[entityId];
+      const deviceId = probes[entityId] || null;
+      /* The device's first hour on the network, if the registry knows when
+         that was. Everything inside it is commissioning. */
+      const joined = deviceId && created[deviceId] ? created[deviceId] : null;
+      const commissionTo = joined === null ? null : joined + UNSTABLE_COMMISSION_MS;
+      const commissioning = (at) => commissionTo !== null && at >= joined && at <= commissionTo;
+      const excused = (at) => inMask(at) || commissioning(at);
       let transitions = 0;
       let downMs = 0;
       let longest = 0;
+      /* The last moment this device's availability genuinely changed, in
+         either direction. A device that dropped at nine and came back at ten
+         has been steady since ten, not since nine. */
+      let lastChange = null;
       for (let i = 0; i < points.length; i++) {
         const p = points[i];
         const until = i + 1 < points.length ? points[i + 1].at : now;
+        if (i > 0 && points[i - 1].down !== p.down && !excused(p.at)) lastChange = p.at;
         if (p.down) {
           /* An outage that began inside a mass window belongs to the mass
              event, not to this device - including however long it took this
-             particular device to come back. */
-          if (inMask(p.at)) continue;
+             particular device to come back. The same is true of an outage
+             during commissioning. */
+          if (excused(p.at)) continue;
           const length = until - p.at;
           downMs += length;
           if (length > longest) longest = length;
@@ -5370,17 +5408,25 @@
         }
       }
       /* The window shrinks by whatever was masked, so a restart costs no
-         device any availability at all. */
-      const measured = Math.max(1, span - maskedMs);
+         device any availability at all - and a device still inside its own
+         commissioning hour loses that hour too. */
+      const commissionOverlap = commissionTo === null ? 0
+        : Math.max(0, Math.min(now, commissionTo) - Math.max(start, joined));
+      const measured = Math.max(1, span - maskedMs - commissionOverlap);
       out.push({
         entityId,
-        deviceId: probes[entityId] || null,
+        deviceId,
         transitions,
         downMs,
         longestMs: longest,
         /* Whether it is unavailable right now, which decides whose finding
            this is rather than how bad it is. */
         down: points[points.length - 1].down,
+        lastChange,
+        /* How long it has been steady. Null when nothing countable ever
+           happened, which is not the same as "steady for zero seconds". */
+        quietMs: lastChange === null ? null : now - lastChange,
+        commissioning: commissionTo !== null && now <= commissionTo,
         availability: Math.max(0, Math.min(1, (measured - downMs) / measured)),
       });
     }
@@ -5409,10 +5455,48 @@
    */
   function unstableBand(row) {
     if (row.down || row.transitions < 1) return null;
-    if (row.availability < UNSTABLE_CRITICAL_AVAILABILITY) return 'critical';
-    if (row.transitions >= UNSTABLE_DISCONNECT_ANOMALY) return 'warning';
-    if (row.availability < UNSTABLE_WARN_AVAILABILITY && row.transitions >= UNSTABLE_MIN_TRANSITIONS) return 'warning';
-    return null;
+    let band = null;
+    if (row.availability < UNSTABLE_CRITICAL_AVAILABILITY) band = 'critical';
+    else if (row.transitions >= UNSTABLE_DISCONNECT_ANOMALY) band = 'warning';
+    else if (row.availability < UNSTABLE_WARN_AVAILABILITY && row.transitions >= UNSTABLE_MIN_TRANSITIONS) band = 'warning';
+    if (!band) return null;
+    /* The day was bad and the last two hours were not. The figures stay on
+       the page - they are true, and they are the reason to keep an eye on it -
+       but a device that has been steady since lunchtime is not a thing to do
+       something about now, and a red row that outlives its own cause teaches
+       people to stop reading red rows. */
+    if (row.quietMs !== null && row.quietMs >= UNSTABLE_QUIET_MS) return 'recovered';
+    return band;
+  }
+
+  /** True for the bands that mean "this is happening now". */
+  function unstableActive(band) {
+    return band === 'critical' || band === 'warning';
+  }
+
+  /**
+   * deviceId -> the epoch millisecond the device joined, for every device the
+   * registry can actually date.
+   *
+   * `created_at` is written by the device registry itself when the device is
+   * first added, so it is the moment of pairing rather than an inference from
+   * a name or an entity id. Devices without it - an older registry entry, or
+   * an integration that never set it - simply get no grace, which is the
+   * safe direction to fail in.
+   */
+  function unstableCreated(hass) {
+    const devices = (hass && hass.devices) || {};
+    const out = {};
+    for (const id in devices) {
+      const at = devices[id].created_at;
+      if (typeof at !== 'number' || !isFinite(at) || at <= 0) continue;
+      /* The registry stores epoch seconds. Anything that looks like it is
+         already milliseconds, or is in the future, is not trusted. */
+      const ms = at > 1e11 ? at : at * 1000;
+      if (ms > Date.now() + 60000) continue;
+      out[id] = ms;
+    }
+    return out;
   }
 
   const unstableCache = { at: 0, data: null, running: false };
@@ -5437,6 +5521,7 @@
     if (unstableCache.running) return Promise.resolve(unstableCache.data);
     unstableCache.running = true;
     const probes = unstableProbes(hass);
+    const created = unstableCreated(hass);
     const ids = Object.keys(probes);
     if (!ids.length) {
       unstableCache.running = false;
@@ -5452,7 +5537,7 @@
       no_attributes: true,
       significant_changes_only: false,
     }).then((history) => {
-      const result = computeUnstable(history, probes, now);
+      const result = computeUnstable(history, probes, now, { created });
       result.queryMs = Math.round((performance.now ? performance.now() : Date.now()) - started);
       result.probes = ids.length;
       unstableCache.running = false;
@@ -5616,22 +5701,37 @@
       .filter((r) => r.band && !(r.deviceId && skipped.has(r.deviceId)))
       .sort((a, b) => a.availability - b.availability || b.transitions - a.transitions);
     if (!rows.length) return '';
-    const body = rows.map((r) => {
+    const row = (r) => {
       const dev = r.deviceId && devices[r.deviceId];
       const name = dev ? (dev.name_by_user || dev.name || r.entityId) : r.entityId;
       const pct = Math.round(r.availability * 1000) / 10;
-      return '<div class="unrow band-' + (r.band === 'critical' ? 'critical' : 'warn') + '">' +
-        '<ha-icon icon="mdi:transit-connection-variant"></ha-icon>' +
+      const band = r.band === 'critical' ? 'critical' : r.band === 'warning' ? 'warn' : 'muted';
+      /* A recovered row keeps the whole day's figures. Deleting them the
+         moment a device settles would throw away the only evidence that
+         anything happened. */
+      const last = r.band === 'recovered'
+        ? '<span class="unlongest">Stable for ' + esc(durationText(r.quietMs)) + '</span>'
+        : '<span class="unlongest">Longest outage ' + esc(durationText(r.longestMs)) + '</span>';
+      return '<div class="unrow band-' + band + '">' +
+        '<ha-icon icon="' + (r.band === 'recovered' ? 'mdi:check-circle-outline' : 'mdi:transit-connection-variant') + '"></ha-icon>' +
         '<span class="untext"><span class="unname">' + esc(name) + '</span>' +
-        '<span class="undetail">' + pct + '% available · ' + r.transitions +
+        '<span class="undetail">' + pct + '% today · ' + r.transitions +
         ' disconnect' + (r.transitions === 1 ? '' : 's') + ' · ' +
-        esc(durationText(r.downMs)) + ' offline</span>' +
-        '<span class="unlongest">Longest outage ' + esc(durationText(r.longestMs)) + '</span></span></div>';
-    }).join('');
+        esc(durationText(r.downMs)) + ' offline</span>' + last + '</span></div>';
+    };
+    const active = rows.filter((r) => unstableActive(r.band));
+    const past = rows.filter((r) => r.band === 'recovered');
     const note = un.maskedWindows
       ? un.maskedWindows + ' restart window' + (un.maskedWindows === 1 ? '' : 's') + ' excluded'
       : 'last 24 hours';
-    return sectionHtml('Unstable devices', note, '<div class="unrows">' + body + '</div>', 'sec-unstable');
+    let body = '';
+    if (active.length) body += '<div class="unrows">' + active.map(row).join('') + '</div>';
+    if (past.length) {
+      body += '<div class="exgroup is-past" style="margin-top:' + (active.length ? '10px' : '0') + '">' +
+        '<span class="exlabel">Recently recovered · ' + past.length + '</span>' +
+        '<div class="unrows">' + past.map(row).join('') + '</div></div>';
+    }
+    return sectionHtml('Unstable devices', note, body, 'sec-unstable');
   }
 
   function configSection(model, state) {
@@ -6270,7 +6370,8 @@ ha-card.mini.overall { overflow: hidden; }
 .sysrow.band-warn, .unrow.band-warn {
   box-shadow: inset 3px 0 0 var(--warning-color, #ffa726);
 }
-.execrow.band-muted { opacity: 0.7; }
+.execrow.band-muted, .unrow.band-muted { opacity: 0.7; }
+.unrow.band-muted ha-icon { color: var(--success-color, #43a047); }
 @container dhcard (max-width: 420px) {
   .exline { grid-template-columns: 1fr; gap: 0; }
   .sysitems { white-space: normal; }
@@ -7615,7 +7716,8 @@ ha-card.mini.overall { overflow: hidden; }
     analyseConflicts, conflictsCompact, overallCompact, sequenceDuration, durationSeconds, triggerOccurrences,
     collectTargets, areOpposites, clockToMinutes, minutesToClock, DEFAULT_CONFLICTS,
     deviceCompact, configCompact,
-    opsModel, computeUnstable, unstableBand, unstableProbes, unstableRank,
+    opsModel, computeUnstable, unstableBand, unstableActive, unstableProbes, unstableRank,
+    unstableCreated,
     systemSection, executionHtml, unstableSection,
     UNSTABLE: {
       warn: UNSTABLE_WARN_AVAILABILITY,
@@ -7625,6 +7727,8 @@ ha-card.mini.overall { overflow: hidden; }
       massRatio: UNSTABLE_MASS_RATIO,
       massPadMs: UNSTABLE_MASS_PAD_MS,
       windowMs: UNSTABLE_WINDOW_MS,
+      quietMs: UNSTABLE_QUIET_MS,
+      commissionMs: UNSTABLE_COMMISSION_MS,
     },
     DEFAULTS: {
       ignored_domains: DEFAULT_IGNORED_DOMAINS,
