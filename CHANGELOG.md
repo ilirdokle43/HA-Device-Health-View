@@ -4,6 +4,40 @@ Releases are dated: `YEAR.MONTH.DAY`, matching how Home Assistant itself version
 A second release on the same day gains a `.1`, a third a `.2`, and the suffix resets
 when the date changes.
 
+## 2026.8.29.1
+
+### Added
+
+- **EXECUTION ERROR, a fourth configuration tier.** A configuration can be entirely valid and
+  the house still not do as it was told. On the install this was built for, a water-safety
+  automation tried to switch off a running pump 94 times in 93 minutes and failed every time -
+  every reference valid, every entity present, the page reporting perfect health. Failures are
+  read from Home Assistant's own deduplicated error store, so 94 failures arrive as **one**
+  incident carrying the failing step, the error text, the first and latest failure, how many
+  landed in the last hour and whether it is still recurring. Three failures in an hour make it
+  actionable; one does not. An automation labelled `safety_critical` in the entity registry is
+  actionable on the first failure - a label someone applied, never inferred from a name. When
+  the failures stop the incident stays as recently recovered for a day and then goes.
+- **A SYSTEM section**, hidden completely when there is nothing wrong. Add-ons that are in an
+  error state or were set to start on boot and did not; the age of the last successful
+  automatic backup; a count of active native Home Assistant repairs; supervisor resolution
+  issues; and integrations that keep throwing behind a config entry that still says `loaded`.
+- **Unstable devices.** The same devices the page already lists, seen over a day instead of at
+  an instant: availability, disconnect count and longest outage over 24 hours. A device that is
+  up when you look and spent six hours unreachable this morning was previously invisible here.
+  Transitions caused by a Home Assistant or coordinator restart are excluded - the restart is
+  recognised from its own shape, a third of the house dropping inside one minute, so it covers
+  restarts of things that have no entity to watch.
+- Two published sensors, `sensor.config_health_execution_errors` and `sensor.config_health_system`,
+  and notifications for both new tiers, sharing the incident store so nothing is reported twice.
+
+### Changed
+
+- The main-dashboard tile now rises for a currently failing automation, an add-on in an error
+  state, a stale or failed backup, an integration that has been failing for hours, and a device
+  below 80% availability. It deliberately does **not** rise for a repair, a supervisor issue, a
+  device between 95% and 99%, or a recovered execution error.
+
 ## 2026.8.29
 
 ### Fixed

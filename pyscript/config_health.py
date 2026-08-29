@@ -255,6 +255,22 @@ ENTITIES = [
      "tpl": "{{ value_json.last_scan }}", "device_class": "timestamp"},
 ]
 
+# The operational detectors publish on their own retained topic. Separate
+# from the scan's, because they run on a different clock: the configuration
+# scan is nightly plus on demand, and these follow the house every five
+# minutes. One topic per cadence keeps a quiet scan from republishing a busy
+# operational document and the other way round.
+OPS_TOPIC = BASE + "/ops"
+
+OPS_ENTITIES = [
+    {"key": "execution_errors", "domain": "sensor", "name": "Execution errors",
+     "icon": "mdi:play-box-remove-outline", "tpl": "{{ value_json.execution }}",
+     "unit": "incidents", "state_class": "measurement", "attrs": "execution_attrs"},
+    {"key": "system", "domain": "sensor", "name": "System",
+     "icon": "mdi:server", "tpl": "{{ value_json.system }}",
+     "unit": "findings", "state_class": "measurement", "attrs": "system_attrs"},
+]
+
 
 def _publish_discovery():
     """Announce the entities. Retained, so a restart finds them already there."""
@@ -280,6 +296,23 @@ def _publish_discovery():
         if spec.get("attrs"):
             cfg["json_attributes_topic"] = STATE_TOPIC
             cfg["json_attributes_template"] = "{{ value_json.%s | tojson }}" % spec["attrs"]
+        service.call("mqtt", "publish", retain=True,
+                     topic=f"{DISC}/{spec['domain']}/{BASE}/{spec['key']}/config",
+                     payload=json.dumps(cfg))
+    for spec in OPS_ENTITIES:
+        cfg = {
+            "name": spec["name"],
+            "object_id": BASE + "_" + spec["key"],
+            "unique_id": BASE + "_" + spec["key"],
+            "state_topic": OPS_TOPIC,
+            "value_template": spec["tpl"],
+            "icon": spec.get("icon"),
+            "device": DEVICE,
+            "unit_of_measurement": spec.get("unit"),
+            "state_class": spec.get("state_class"),
+            "json_attributes_topic": OPS_TOPIC,
+            "json_attributes_template": "{{ value_json.%s | tojson }}" % spec["attrs"],
+        }
         service.call("mqtt", "publish", retain=True,
                      topic=f"{DISC}/{spec['domain']}/{BASE}/{spec['key']}/config",
                      payload=json.dumps(cfg))
@@ -321,6 +354,40 @@ def _publish_state(summary):
     }
     service.call("mqtt", "publish", retain=True, topic=STATE_TOPIC,
                  payload=json.dumps(payload))
+
+
+def _publish_ops(payload):
+    """The operational counters, as one retained document.
+
+    Only the live findings are counted. A recovered execution error still
+    belongs on the page as evidence of what happened, but a sensor that keeps
+    reading 1 for six hours after the problem stopped is a sensor nobody can
+    build an automation on.
+    """
+    execution = [e for e in payload["execution"] if e["severity"] == "actionable"]
+    system = [s for s in payload["system"]
+              if s["severity"] in ("actionable", "critical")]
+    integrations = [i for i in payload["integrations"] if i["severity"] == "critical"]
+    body = {
+        "execution": len(execution),
+        "system": len(system) + len(integrations),
+        "execution_attrs": {
+            "recovered": len([e for e in payload["execution"]
+                              if e["severity"] == "recovered"]),
+            "failures": sum([e["failures"] for e in execution]),
+            "items": [e["name"] for e in execution][:6],
+            "generated": payload["generated"],
+        },
+        "system_attrs": {
+            "addons": len([s for s in system if s["kind"] == "addon"]),
+            "backup": len([s for s in system if s["kind"] == "backup"]),
+            "integrations": len(integrations),
+            "items": [s["name"] for s in system] + [i["domain"] for i in integrations],
+            "generated": payload["generated"],
+        },
+    }
+    service.call("mqtt", "publish", retain=True, topic=OPS_TOPIC,
+                 payload=json.dumps(body))
 
 
 # --- notifications ------------------------------------------------------
@@ -374,8 +441,412 @@ def _notify_pass(findings, background, state):
     return fresh, message
 
 
+# ======================================================================
+# OPERATIONAL HEALTH
+#
+# The configuration scanner answers "does this point at something that
+# exists". These detectors answer "is it working", which is a different
+# question with different evidence, and on 2026-08-29 the difference cost a
+# morning: a water-safety automation failed to switch off a running pump 94
+# times in 93 minutes while every dashboard in the house stayed green,
+# because every reference in it was perfectly valid.
+#
+# Nothing here parses a log file. Home Assistant already keeps its own
+# deduplicated error store, the supervisor already knows what its add-ons
+# are doing, and the backup manager already publishes when it last
+# succeeded. Reading structured state beats scraping text, and it is what
+# makes "94 failures" arrive as one incident instead of ninety-four.
+# ======================================================================
+
+OPS_ENTITY = "pyscript.config_health_ops"
+
+# The label that marks an automation as safety-critical, where one failed
+# attempt is already the whole story. It is read from the entity registry and
+# never inferred: an automation is safety-critical because someone said so,
+# not because of what it is called.
+SAFETY_LABEL = "safety_critical"
+
+# Lists are capped before they reach the state machine. A page cannot use
+# forty execution incidents and the recorder should not have to store them.
+OPS_LIST_CAP = 20
+OPS_TEXT_CAP = 240
+
+_OPS = {}
+
+
+def _system_log_records():
+    """Home Assistant's own deduplicated WARNING/ERROR store.
+
+    `hass.data["system_log"]` is the handler the system_log websocket API
+    reads, and `records.to_list()` is exactly what that API returns: one
+    entry per (logger, source line), each carrying a running count and the
+    first and last time it fired. It holds 50 entries and is cleared by a
+    restart, so this is a "since Home Assistant started" view - which is the
+    right window for "is this still happening".
+    """
+    try:
+        handler = hass.data.get("system_log")
+        return list(handler.records.to_list()) if handler else []
+    except Exception as err:
+        log.warning(f"config_health: system_log unavailable ({err})")
+        return []
+
+
+def _safety_automations():
+    """Entity ids carrying the safety label, from the entity registry."""
+    try:
+        from homeassistant.helpers import entity_registry, label_registry
+        lreg = label_registry.async_get(hass)
+        wanted = set()
+        for lab in lreg.async_list_labels():
+            if lab.label_id == SAFETY_LABEL or lab.name.lower().replace(" ", "_") == SAFETY_LABEL:
+                wanted.add(lab.label_id)
+        if not wanted:
+            return set()
+        ereg = entity_registry.async_get(hass)
+        return set([e.entity_id for e in ereg.entities.values()
+                    if wanted & set(e.labels or ())])
+    except Exception:
+        return set()
+
+
+def _repair_issues():
+    """Active native Home Assistant repairs, ignoring the ignored ones.
+
+    A repair someone has dismissed is a decision, not a finding, so it never
+    reaches the count. Everything else is reported with the severity Home
+    Assistant itself gave it.
+    """
+    try:
+        from homeassistant.helpers import issue_registry
+        reg = issue_registry.async_get(hass)
+        out = []
+        for issue in reg.issues.values():
+            if issue.dismissed_version or not issue.active:
+                continue
+            out.append({
+                "domain": issue.domain,
+                "issue_id": issue.issue_id,
+                "severity": issue.severity if isinstance(issue.severity, str)
+                else getattr(issue.severity, "value", "warning"),
+                "breaks_in": issue.breaks_in_ha_version,
+                "translation_key": issue.translation_key,
+                "fixable": bool(issue.is_fixable),
+            })
+        return out
+    except Exception as err:
+        log.warning(f"config_health: issue registry unavailable ({err})")
+        return []
+
+
+async def _supervisor(path):
+    """One GET against the supervisor, or None when there is no supervisor.
+
+    A container or core install has no SUPERVISOR_TOKEN, and that is not an
+    error - it means the add-on and resolution detectors have nothing to say
+    and should stay silent rather than reporting a failure.
+    """
+    import os
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        return None
+    try:
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+        session = async_get_clientsession(hass)
+        resp = await session.get("http://supervisor" + path,
+                                 headers={"Authorization": "Bearer " + token},
+                                 timeout=aiohttp_timeout())
+        if resp.status != 200:
+            return None
+        body = await resp.json()
+        return body.get("data", body)
+    except Exception as err:
+        log.warning(f"config_health: supervisor {path} unavailable ({err})")
+        return None
+
+
+def aiohttp_timeout():
+    import aiohttp
+    return aiohttp.ClientTimeout(total=10)
+
+
+def _addons():
+    try:
+        from homeassistant.components.hassio import get_addons_info
+        return get_addons_info(hass) or {}
+    except Exception:
+        return {}
+
+
+def _backup_times():
+    """(last success, last attempt) as epochs, from the native entities."""
+    def epoch(entity_id):
+        st = hass.states.get(entity_id)
+        if st is None or st.state in (None, "", "unknown", "unavailable"):
+            return None
+        try:
+            from homeassistant.util import dt as dt_util
+            parsed = dt_util.parse_datetime(st.state)
+            return parsed.timestamp() if parsed else None
+        except Exception:
+            return None
+    return (epoch("sensor.backup_last_successful_automatic_backup"),
+            epoch("sensor.backup_last_attempted_automatic_backup"))
+
+
+def _entity_name(entity_id):
+    st = hass.states.get(entity_id)
+    if st is not None:
+        name = (st.attributes or {}).get("friendly_name")
+        if name:
+            return name
+    return entity_id.split(".", 1)[-1].replace("_", " ")
+
+
+def _entry_titles(domain):
+    """Config entry titles for an integration, so an error can name what it
+    belongs to. One entry means the mapping is certain; several mean the
+    error belongs to one of them and this cannot tell which."""
+    try:
+        entries = hass.config_entries.async_entries(domain)
+        return [e.title for e in entries]
+    except Exception:
+        return []
+
+
+def _ops_execution(incidents, now_ts, safety):
+    """Execution-error incidents, one per automation or script."""
+    parsed = []
+    for inc in incidents:
+        if inc["level"] != "ERROR":
+            continue
+        p = ha_config_scan.parse_execution(inc)
+        if p:
+            parsed.append((p, inc))
+    out = []
+    for item in ha_config_scan.merge_executions(parsed):
+        is_safety = item["entity_id"] in safety
+        sev = ha_config_scan.execution_severity(
+            item["recent"], item["last"], now_ts, safety=is_safety)
+        if sev == "gone":
+            continue
+        st = hass.states.get(item["entity_id"])
+        out.append({
+            "entity_id": item["entity_id"],
+            "type": item["domain"],
+            "name": _entity_name(item["entity_id"]),
+            "where": item["where"],
+            "step": item["step"],
+            "error": (item["error"] or "")[:OPS_TEXT_CAP],
+            "failures": item["count"],
+            "recent": item["recent"],
+            "first": _stamp(item["first"]),
+            "last": _stamp(item["last"]),
+            "quiet_for": int(max(0, now_ts - item["last"])),
+            "severity": sev,
+            "safety": is_safety,
+            "recurring": sev == "actionable",
+            "enabled": bool(st is not None and st.state == "on"),
+            "fp": "exec:" + item["entity_id"],
+        })
+    return out[:OPS_LIST_CAP]
+
+
+def _ops_integrations(incidents, now_ts):
+    """Integrations throwing repeatedly behind a config entry that still
+    claims to be loaded - the Tapo camera class, where nothing else in Home
+    Assistant says anything is wrong."""
+    out = []
+    for inc in incidents:
+        if inc["level"] != "ERROR" or ha_config_scan.log_is_noise(inc["name"]):
+            continue
+        if ha_config_scan.parse_execution(inc):
+            continue  # an execution error, reported as one
+        domain, confidence = ha_config_scan.integration_of(inc)
+        if not domain:
+            continue
+        sev = ha_config_scan.integration_severity(
+            inc["recent"], inc["last"], inc["first"], now_ts, inc["count"])
+        if sev == "quiet":
+            continue
+        titles = _entry_titles(domain)
+        out.append({
+            "domain": domain,
+            "confidence": confidence,
+            # Naming the wrong device is worse than naming none, so a domain
+            # with several entries reports the count instead of guessing.
+            "entry": titles[0] if len(titles) == 1 else None,
+            "entries": len(titles),
+            "logger": inc["name"],
+            "message": (inc["message"] or "")[:OPS_TEXT_CAP],
+            "errors": inc["count"],
+            "recent": inc["recent"],
+            "first": _stamp(inc["first"]),
+            "last": _stamp(inc["last"]),
+            "severity": sev,
+            "fp": "integ:" + domain + ":" + inc["key"],
+        })
+    out.sort(key=lambda x: (0 if x["severity"] == "critical" else 1, -x["recent"]))
+    return out[:OPS_LIST_CAP]
+
+
+async def _ops_system(now_ts):
+    """The house's own machinery: add-ons, backups, repairs, supervisor."""
+    out = []
+    for f in ha_config_scan.addon_findings(_addons()):
+        out.append({
+            "kind": "addon", "name": f["name"], "detail": f["message"],
+            "severity": f["severity"], "state": f["state"],
+            "url": "/hassio/addon/" + f["slug"] + "/info",
+            "fp": "addon:" + f["slug"],
+        })
+    success, attempt = _backup_times()
+    b = ha_config_scan.backup_finding(success, attempt, now_ts)
+    if b:
+        out.append({
+            "kind": "backup", "name": "Backup", "detail": b["message"],
+            "severity": b["severity"], "url": "/config/backup",
+            "fp": "backup",
+        })
+    issues = _repair_issues()
+    if issues:
+        worst = "actionable" if any([i["severity"] == "critical" for i in issues]) else "warning"
+        out.append({
+            "kind": "repairs", "name": "Home Assistant Repairs",
+            "detail": "%d active issue%s" % (len(issues), "" if len(issues) == 1 else "s"),
+            "severity": worst, "url": "/config/repairs", "count": len(issues),
+            "items": [i["domain"] + ": " + (i["translation_key"] or i["issue_id"])[:60]
+                      for i in issues[:6]],
+            "fp": "repairs",
+        })
+    res = await _supervisor("/resolution/info")
+    if res:
+        sup_issues = res.get("issues") or []
+        unsupported = res.get("unsupported") or []
+        unhealthy = res.get("unhealthy") or []
+        if sup_issues or unsupported or unhealthy:
+            bits = [i.get("type") for i in sup_issues if i.get("type")]
+            out.append({
+                # Deliberately never actionable. The one issue this install
+                # has - no_current_backup - is set because Home Assistant's
+                # automatic backups are partial (core, add-ons and ssl) while
+                # the supervisor's check only counts full backups, so it can
+                # never clear on its own and must not be allowed to shout.
+                "kind": "supervisor", "name": "Supervisor",
+                "detail": ", ".join(bits) or "reported an issue",
+                "severity": "critical" if unhealthy else "warning",
+                "url": "/config/hardware", "count": len(sup_issues),
+                "items": bits[:6], "fp": "supervisor",
+            })
+    return out
+
+
+def _stamp(epoch):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(epoch)))
+    except Exception:
+        return None
+
+
+def _ops_signature(payload):
+    """What has to change before the state machine is written again.
+
+    The counts and the identities matter; the ever-advancing "last seen"
+    timestamp does not. Without this the entity would be rewritten every five
+    minutes forever, and the recorder would carry a few megabytes a day of a
+    document that mostly says the same thing.
+    """
+    def sig(items, *keys):
+        return [[str(i.get(k)) for k in keys] for i in items]
+    return json.dumps([
+        sig(payload["execution"], "fp", "severity", "failures"),
+        sig(payload["integrations"], "fp", "severity"),
+        sig(payload["system"], "fp", "severity", "detail"),
+    ], sort_keys=True)
+
+
+async def _ops_scan(background=True):
+    """One pass over every operational detector. Returns the payload."""
+    started = time.time()
+    now_ts = time.time()
+    records = _system_log_records()
+    prev = task.executor(ha_config_scan.load_log_state)
+    incidents, fresh_state = ha_config_scan.fold_log_window(records, prev, now_ts)
+    task.executor(ha_config_scan.save_log_state, fresh_state, _now())
+    safety = _safety_automations()
+    payload = {
+        "generated": _now(),
+        "execution": _ops_execution(incidents, now_ts, safety),
+        "integrations": _ops_integrations(incidents, now_ts),
+        "system": await _ops_system(now_ts),
+        "log_records": len(records),
+        "scan_seconds": round(time.time() - started, 3),
+    }
+    _OPS["payload"] = payload
+    signature = _ops_signature(payload)
+    if _OPS.get("signature") != signature:
+        _OPS["signature"] = signature
+        exec_live = [e for e in payload["execution"] if e["severity"] == "actionable"]
+        sys_live = [s for s in payload["system"]
+                    if s["severity"] in ("actionable", "critical")]
+        integ_live = [i for i in payload["integrations"] if i["severity"] == "critical"]
+        state.set(
+            OPS_ENTITY,
+            len(exec_live) + len(sys_live) + len(integ_live),
+            new_attributes={
+                "friendly_name": "Config Health Operations",
+                "icon": "mdi:pulse",
+                "generated": payload["generated"],
+                "execution": payload["execution"],
+                "integrations": payload["integrations"],
+                "system": payload["system"],
+                "log_records": payload["log_records"],
+                "scan_seconds": payload["scan_seconds"],
+            },
+        )
+    _publish_ops(payload)
+    return payload
+
+
+def _ops_notify(payload, state_store, background):
+    """New actionable operational problems, folded into the same incident
+    store the configuration findings use, so one thing that has already been
+    reported is never reported twice."""
+    findings = []
+    for e in payload["execution"]:
+        if e["severity"] != "actionable":
+            continue
+        findings.append({
+            "fp": e["fp"], "severity": "execution", "kind": "execution",
+            "ref": e["entity_id"], "owner": e["entity_id"],
+            "owner_name": e["name"], "owner_type": e["type"],
+            "problem": "%d failed action%s, latest %s"
+                       % (e["failures"], "" if e["failures"] == 1 else "s",
+                          (e["last"] or "")[11:16]),
+        })
+    for s in payload["system"]:
+        if s["severity"] not in ("actionable", "critical"):
+            continue
+        findings.append({
+            "fp": s["fp"], "severity": "system", "kind": s["kind"],
+            "ref": s["fp"], "owner": s["fp"], "owner_name": s["name"],
+            "owner_type": s["kind"], "problem": s["detail"],
+        })
+    for i in payload["integrations"]:
+        if i["severity"] != "critical":
+            continue
+        findings.append({
+            "fp": i["fp"], "severity": "system", "kind": "integration",
+            "ref": i["domain"], "owner": i["domain"],
+            "owner_name": i["entry"] or i["domain"],
+            "owner_type": "integration",
+            "problem": "%d errors, still failing" % i["errors"],
+        })
+    return findings
+
+
 @service(supports_response="optional")
-def config_health_rescan(manual=True):
+async def config_health_rescan(manual=True):
     """Rescan the configuration. Read-only: it parses, it never repairs.
 
     Answers with the summary an automation would want - status and the three
@@ -383,7 +854,17 @@ def config_health_rescan(manual=True):
     The dependency universe stays behind config_health_deps; nobody wants
     eighty kilobytes of edges as the reply to "is anything broken?".
     """
-    return _run_scan(bool(manual))
+    summary = _run_scan(bool(manual))
+    # Pressing Rescan should refresh the whole page, not the half of it that
+    # comes from files.
+    ops = await _ops_scan()
+    summary["execution_errors"] = len([e for e in ops["execution"]
+                                       if e["severity"] == "actionable"])
+    summary["system_findings"] = len([f for f in ops["system"]
+                                      if f["severity"] in ("actionable", "critical")])
+    summary["integration_errors"] = len([i for i in ops["integrations"]
+                                         if i["severity"] == "critical"])
+    return summary
 
 
 def _run_scan(manual):
@@ -708,7 +1189,7 @@ def config_health_deps():
 
 
 @time_trigger("startup")
-def config_health_startup():
+async def config_health_startup():
     """First scan after a restart, and a quiet window around it.
 
     Everything is briefly unavailable while Home Assistant comes up, so the
@@ -721,6 +1202,7 @@ def config_health_startup():
     task.executor(ha_config_scan.save_notify_state, state)
     _publish_discovery()
     _run_scan(manual=True)
+    await _ops_scan()
 
 
 @time_trigger("cron(17 4 * * *)")
@@ -730,7 +1212,7 @@ def config_health_auto():
 
 
 @time_trigger("cron(*/5 * * * *)")
-def config_health_runtime():
+async def config_health_runtime():
     """Runtime-only re-evaluation, every five minutes.
 
     A reference breaking is a configuration event and needs a file scan; a
@@ -763,7 +1245,11 @@ def config_health_runtime():
         "last_successful_scan": state.get("last_successful_scan"),
         "scan_seconds": round(time.time() - started, 3), "error": None,
     })
-    fresh, message = _notify_pass(findings, True, state)
+    # The operational detectors run on the same five-minute beat and share the
+    # incident store, so one pass decides what the phone hears about and the
+    # two halves can never notify about the same minute separately.
+    ops = await _ops_scan()
+    fresh, message = _notify_pass(findings + _ops_notify(ops, state, True), True, state)
     # All three, so a scan that later fails has a real last-known figure to
     # hold rather than falling back to zero and reading as healthy.
     state["last_broken"] = summary["broken"]

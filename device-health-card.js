@@ -61,7 +61,7 @@
      matches the newest CHANGELOG heading: a banner that lies about which
      build is loaded is worse than no banner, because a stale page and an
      up-to-date one then look identical. */
-  const CARD_VERSION = '2026.8.29';
+  const CARD_VERSION = '2026.8.29.1';
   const STORE_KEY = 'device-health-card:v1';
 
   /* ================================================================== *
@@ -186,8 +186,13 @@
   const isCompact = (mode) => mode !== 'full';
 
   const DEFAULT_SECTIONS = [
-    'house', 'summary', 'config_summary', 'clusters', 'attention', 'config', 'conflicts',
-    'battery', 'integrations', 'recovered', 'deleted', 'skipped', 'orphans',
+    /* `system` sits above everything because an add-on that has crashed or a
+       backup that stopped running outranks any single device, and it hides
+       itself completely when there is nothing to say. `unstable` sits with
+       the devices because it is the same devices, seen over a day. */
+    'house', 'system', 'summary', 'config_summary', 'clusters', 'attention', 'unstable',
+    'config', 'conflicts', 'battery', 'integrations', 'recovered', 'deleted', 'skipped',
+    'orphans',
   ];
 
   /* States that carry no usable reading. */
@@ -4138,6 +4143,47 @@
       });
     }
 
+    /* The operational groups. Each has one rule for reaching a main
+       dashboard, and each rule is deliberately narrower than what the full
+       page shows: a repair, a supervisor note or a device at 96% belongs on
+       the Health page and nowhere else. */
+    const ops = model.ops;
+    const opsItems = [];
+    if (ops) {
+      const failing = ops.execution.filter((e) => e.severity === 'actionable');
+      if (failing.length) {
+        opsItems.push(line(failing.length, 'automation failing', 'automations failing'));
+      }
+      const addons = ops.system.filter((x) => x.kind === 'addon' && x.severity === 'actionable');
+      if (addons.length) opsItems.push(line(addons.length, 'add-on down', 'add-ons down'));
+      const backup = ops.system.filter(
+        (x) => x.kind === 'backup' && (x.severity === 'actionable' || x.severity === 'critical'));
+      if (backup.length) opsItems.push('backup stale');
+      const integ = ops.integrations.filter((i) => i.severity === 'critical');
+      if (integ.length) opsItems.push(line(integ.length, 'integration failing', 'integrations failing'));
+    }
+    if (opsItems.length) {
+      groups.push({
+        key: 'system', label: 'System', items: opsItems,
+        band: 'critical', serious: true,
+      });
+    }
+
+    /* A device that spent a fifth of the day unreachable is worth the main
+       dashboard; one at 96% is not, and neither is a weak radio link. */
+    const un = model.unstable;
+    if (un && un.devices) {
+      const bad = un.devices.filter(
+        (r) => unstableBand(r) === 'critical' &&
+          !(r.deviceId && model.skipped && model.skipped.has(r.deviceId)));
+      if (bad.length) {
+        groups.push({
+          key: 'unstable', label: 'Unstable', items: [line(bad.length, 'device', 'devices') + ' below 80% today'],
+          band: 'critical', serious: true,
+        });
+      }
+    }
+
     const clash = [];
     if (con && con.counts) {
       if (num(con.counts.critical)) clash.push(line(con.counts.critical, 'critical', 'critical'));
@@ -4380,7 +4426,29 @@
     };
   }
 
-  function configCompact(conf) {
+  function configCompact(conf, ops) {
+    /* An automation that is failing right now outranks anything a reference
+       scan can find, so it is tested before the scan is even consulted - and
+       it shows on an install whose configuration is otherwise spotless,
+       which is exactly the case that went unnoticed. Only currently
+       recurring incidents qualify: a recovered one is history, and history
+       does not belong on a main dashboard. */
+    const failing = ops ? ops.execution.filter((e) => e.severity === 'actionable') : [];
+    if (failing.length) {
+      const worst = failing[0];
+      return {
+        band: 'critical',
+        icon: 'mdi:play-box-remove-outline',
+        count: failing.length,
+        label: failing.length === 1 ? 'Failing' : 'Failing',
+        detail: failing.length === 1
+          ? worst.name + ' · ' + worst.failures + ' failed action' +
+            (worst.failures === 1 ? '' : 's') + ' · latest ' + String(worst.last || '').slice(11, 16)
+          : failing.length + ' automations failing · ' +
+            failing.reduce((n, e) => n + e.failures, 0) + ' failed actions',
+      };
+    }
+
     /* `ready` is stamped on by the card's cache layer, so its absence just
        means the inspector was called directly; only an explicit false is a
        scan that failed, and a failed scan has nothing to report. */
@@ -5124,12 +5192,459 @@
     );
   }
 
+  /* ================================================================== *
+   * OPERATIONAL HEALTH
+   *
+   * Three things the configuration scanner cannot see, because none of them
+   * is a question about configuration.
+   *
+   * EXECUTION ERRORS. An automation whose references are all valid, whose
+   * entities all exist, which ran exactly when it was supposed to - and
+   * whose action failed. On 2026-08-29 a water-safety automation tried to
+   * switch off a running pump 94 times in 93 minutes and failed every time,
+   * while this page said the configuration was healthy. It was. The action
+   * was not.
+   *
+   * SYSTEM. Add-ons, backups, repairs and the supervisor: the machinery the
+   * house runs on rather than anything the house contains.
+   *
+   * UNSTABLE DEVICES. The same devices the page already lists, seen over a
+   * day instead of at an instant. A device that is up right now and was
+   * offline for six hours this morning is invisible to every other section
+   * here.
+   *
+   * The first two are computed in the backend and read from its published
+   * state; the third is computed here, because it needs a history query and
+   * that is cheap enough to do in the browser and works on an install with
+   * no backend at all.
+   * ================================================================== */
+
+  const OPS_ENTITY = 'pyscript.config_health_ops';
+
+  /** What the backend published, or null on an install without one. */
+  function opsModel(hass) {
+    const st = hass && hass.states && hass.states[OPS_ENTITY];
+    if (!st || st.state === UNAVAILABLE) return null;
+    const a = st.attributes || {};
+    return {
+      generated: a.generated || null,
+      execution: Array.isArray(a.execution) ? a.execution : [],
+      integrations: Array.isArray(a.integrations) ? a.integrations : [],
+      system: Array.isArray(a.system) ? a.system : [],
+    };
+  }
+
+  /* --- unstable devices ---------------------------------------------- *
+   *
+   * "Was it working" rather than "is it working". Availability over a day,
+   * how many times it dropped, and how long the worst gap was.
+   *
+   * Two things make this honest. The first is which entity is asked: one
+   * per device, chosen to be the least chatty one it has, which turned a
+   * 17.2 MB / 7.2 s sweep of every entity into 0.22 MB / 176 ms without
+   * changing a single answer - availability is a property of the device,
+   * so any of its entities can report it, and a power sensor writing a row
+   * a second reports it 80 times more expensively than a switch.
+   *
+   * The second is what is thrown away. A Home Assistant restart takes every
+   * device unavailable at once, and counting that as instability reported 26
+   * perfectly healthy Zigbee devices as flapping six times a day. Rather
+   * than trying to know when Home Assistant restarted - which would still
+   * miss a Zigbee coordinator restart, and there is no entity for that at
+   * all - the mass event is recognised from its own shape: when a third of
+   * the devices in the house go unavailable inside the same minute, that
+   * minute is not about any of them.
+   */
+
+  const UNSTABLE_WINDOW_MS = 24 * 3600 * 1000;
+  /* Fraction of sampled devices dropping inside one bucket that means the
+     cause is upstream of all of them. A third is well above anything a real
+     shared fault produced here and well below a restart, which takes
+     essentially everything. */
+  const UNSTABLE_MASS_RATIO = 0.3;
+  const UNSTABLE_MASS_BUCKET_MS = 60 * 1000;
+  const UNSTABLE_MASS_PAD_MS = 3 * 60 * 1000;
+  const UNSTABLE_WARN_AVAILABILITY = 0.95;
+  const UNSTABLE_CRITICAL_AVAILABILITY = 0.80;
+  const UNSTABLE_MIN_TRANSITIONS = 4;
+  const UNSTABLE_DISCONNECT_ANOMALY = 6;
+  /* Long enough that a page open all day is not re-querying, short enough
+     that pressing Rescan after fixing something shows the change. */
+  const UNSTABLE_TTL_MS = 15 * 60 * 1000;
+
+  /* Entities that write a row a second are the wrong ones to ask. Lower
+     sorts first. */
+  function unstableRank(entityId) {
+    if (/_(power|energy|current|voltage|temperature|humidity|illuminance|pressure|rssi|lqi|signal)\b/.test(entityId)) return 9;
+    const domain = domainOf(entityId);
+    if (domain === 'binary_sensor') return 0;
+    if (domain === 'switch' || domain === 'light' || domain === 'lock' || domain === 'cover') return 1;
+    if (domain === 'climate' || domain === 'fan' || domain === 'media_player') return 2;
+    if (domain === 'sensor') return 5;
+    return 6;
+  }
+
+  /** One cheap entity per device: {entityId -> deviceId}. */
+  function unstableProbes(hass) {
+    const states = hass.states || {};
+    const entities = hass.entities || {};
+    const best = new Map();
+    for (const id in states) {
+      const reg = entities[id];
+      if (!reg || !reg.device_id || reg.disabled_by) continue;
+      const cur = best.get(reg.device_id);
+      if (!cur || unstableRank(id) < unstableRank(cur)) best.set(reg.device_id, id);
+    }
+    const probes = {};
+    for (const [deviceId, entityId] of best) probes[entityId] = deviceId;
+    return probes;
+  }
+
+  /**
+   * Turn raw history into per-device stability. Pure, so the restart rule can
+   * be tested against a synthetic house rather than waited out.
+   *
+   * `history` is what `history/history_during_period` returns with
+   * `minimal_response`: {entity_id: [{s, lu}, ...]}, `lu` in seconds.
+   */
+  function computeUnstable(history, probes, now, windowMs) {
+    const span = windowMs || UNSTABLE_WINDOW_MS;
+    const start = now - span;
+    const series = {};
+    const drops = [];
+
+    for (const entityId in history) {
+      const rows = history[entityId] || [];
+      const points = [];
+      for (const row of rows) {
+        const value = row.s !== undefined ? row.s : row.state;
+        const at = row.lu !== undefined ? row.lu * 1000
+          : (row.last_updated ? Date.parse(row.last_updated) : null);
+        if (at === null || isNaN(at)) continue;
+        points.push({ at: Math.max(at, start), down: value === UNAVAILABLE });
+      }
+      if (!points.length) continue;
+      series[entityId] = points;
+      for (let i = 1; i < points.length; i++) {
+        if (points[i].down && !points[i - 1].down) drops.push(points[i].at);
+      }
+    }
+
+    /* Buckets holding a drop from a large fraction of the house at once. */
+    const buckets = new Map();
+    for (const at of drops) {
+      const b = Math.floor(at / UNSTABLE_MASS_BUCKET_MS);
+      buckets.set(b, (buckets.get(b) || 0) + 1);
+    }
+    const sampled = Object.keys(series).length;
+    const threshold = Math.max(3, Math.ceil(sampled * UNSTABLE_MASS_RATIO));
+    const masked = [];
+    for (const [b, n] of buckets) {
+      if (n >= threshold) {
+        const centre = b * UNSTABLE_MASS_BUCKET_MS;
+        masked.push([centre - UNSTABLE_MASS_PAD_MS, centre + UNSTABLE_MASS_BUCKET_MS + UNSTABLE_MASS_PAD_MS]);
+      }
+    }
+    masked.sort((a, b) => a[0] - b[0]);
+    const inMask = (at) => masked.some((m) => at >= m[0] && at <= m[1]);
+    const maskedMs = masked.reduce((sum, m) => sum + (m[1] - m[0]), 0);
+
+    const out = [];
+    for (const entityId in series) {
+      const points = series[entityId];
+      let transitions = 0;
+      let downMs = 0;
+      let longest = 0;
+      for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        const until = i + 1 < points.length ? points[i + 1].at : now;
+        if (p.down) {
+          /* An outage that began inside a mass window belongs to the mass
+             event, not to this device - including however long it took this
+             particular device to come back. */
+          if (inMask(p.at)) continue;
+          const length = until - p.at;
+          downMs += length;
+          if (length > longest) longest = length;
+          if (i > 0 && !points[i - 1].down) transitions++;
+        }
+      }
+      /* The window shrinks by whatever was masked, so a restart costs no
+         device any availability at all. */
+      const measured = Math.max(1, span - maskedMs);
+      out.push({
+        entityId,
+        deviceId: probes[entityId] || null,
+        transitions,
+        downMs,
+        longestMs: longest,
+        /* Whether it is unavailable right now, which decides whose finding
+           this is rather than how bad it is. */
+        down: points[points.length - 1].down,
+        availability: Math.max(0, Math.min(1, (measured - downMs) / measured)),
+      });
+    }
+    return {
+      devices: out,
+      sampled,
+      maskedWindows: masked.length,
+      maskedMs,
+      threshold,
+      window: span,
+    };
+  }
+
+  /**
+   * warning / critical / null for one device's 24h record.
+   *
+   * Two exclusions, both of them about not saying the same thing twice.
+   *
+   * A device that is unavailable right now belongs to the offline list,
+   * which already says so at the top of the page; repeating it here as
+   * "10.8% available" would be a second row for one problem. And a device
+   * that never transitioned at all is not unstable in any sense - it was
+   * either up the whole day or down the whole day, and measured against the
+   * live house that second case was twelve of the eighteen rows this
+   * produced: televisions, beacons and a car key that simply are not here.
+   */
+  function unstableBand(row) {
+    if (row.down || row.transitions < 1) return null;
+    if (row.availability < UNSTABLE_CRITICAL_AVAILABILITY) return 'critical';
+    if (row.transitions >= UNSTABLE_DISCONNECT_ANOMALY) return 'warning';
+    if (row.availability < UNSTABLE_WARN_AVAILABILITY && row.transitions >= UNSTABLE_MIN_TRANSITIONS) return 'warning';
+    return null;
+  }
+
+  const unstableCache = { at: 0, data: null, running: false };
+  /* Every connected card, so the one query benefits all of them. Without
+     this, a page holding more than one card gave the section to whichever
+     card happened to ask first and left the others waiting for their next
+     tick - the answer was already in hand and simply not delivered. */
+  const liveCards = new Set();
+
+  /**
+   * One history query for the whole house, cached.
+   *
+   * Failure is silent by design: an install with the recorder switched off,
+   * or a user without history access, simply has no UNSTABLE section rather
+   * than an error where a section should be.
+   */
+  function getUnstable(hass, force) {
+    const now = Date.now();
+    if (!force && unstableCache.data && now - unstableCache.at < UNSTABLE_TTL_MS) {
+      return Promise.resolve(unstableCache.data);
+    }
+    if (unstableCache.running) return Promise.resolve(unstableCache.data);
+    unstableCache.running = true;
+    const probes = unstableProbes(hass);
+    const ids = Object.keys(probes);
+    if (!ids.length) {
+      unstableCache.running = false;
+      return Promise.resolve(null);
+    }
+    const started = performance.now ? performance.now() : now;
+    return hass.callWS({
+      type: 'history/history_during_period',
+      start_time: new Date(now - UNSTABLE_WINDOW_MS).toISOString(),
+      end_time: new Date(now).toISOString(),
+      entity_ids: ids,
+      minimal_response: true,
+      no_attributes: true,
+      significant_changes_only: false,
+    }).then((history) => {
+      const result = computeUnstable(history, probes, now);
+      result.queryMs = Math.round((performance.now ? performance.now() : Date.now()) - started);
+      result.probes = ids.length;
+      unstableCache.running = false;
+      /* An empty answer is not an answer. The recorder can be starting up, or
+         briefly unavailable, and caching "no history at all" for a quarter of
+         an hour would hide a genuine outage for exactly as long as it takes
+         someone to give up looking. */
+      if (!result.sampled) return unstableCache.data;
+      unstableCache.at = Date.now();
+      unstableCache.data = result;
+      return result;
+    }).catch(() => {
+      unstableCache.running = false;
+      unstableCache.at = Date.now();
+      return unstableCache.data;
+    });
+  }
+
+  /* --- rendering ------------------------------------------------------ */
+
+  const SYSTEM_ICON = {
+    addon: 'mdi:puzzle-outline',
+    backup: 'mdi:backup-restore',
+    repairs: 'mdi:wrench-outline',
+    supervisor: 'mdi:shield-outline',
+    integration: 'mdi:power-plug-outline',
+  };
+
+  const SYSTEM_BAND = {
+    actionable: 'critical',
+    critical: 'critical',
+    warning: 'warn',
+  };
+
+  /**
+   * One row per current system problem, and nothing at all when there are
+   * none. Five separate sections would have been five headings to skip past
+   * on a healthy day; this is one, and on a healthy day it is not there.
+   */
+  function systemSection(model) {
+    const ops = model.ops;
+    if (!ops) return '';
+    const rows = ops.system.slice();
+    /* An integration failing behind a config entry that still says `loaded`
+       belongs here rather than with the devices: the fault is in the
+       integration, and the devices it owns look perfectly fine. */
+    for (const i of ops.integrations) {
+      rows.push({
+        kind: 'integration',
+        name: i.entry || i.domain,
+        detail: i.errors + ' error' + (i.errors === 1 ? '' : 's') +
+          (i.entries > 1 ? ' · ' + i.domain + ', entry not identified' : '') +
+          ' · still failing',
+        severity: i.severity,
+        url: '/config/integrations/integration/' + i.domain,
+        note: i.message,
+      });
+    }
+    if (!rows.length) return '';
+    /* `|| 2` here put the actionable rows last, because their rank is 0. */
+    const order = { actionable: 0, critical: 0, warning: 1 };
+    const rank = (r) => (r.severity in order ? order[r.severity] : 2);
+    rows.sort((a, b) => rank(a) - rank(b));
+    const body = rows.map((r) => {
+      const band = SYSTEM_BAND[r.severity] || 'warn';
+      /* The supervisor's one issue is its own summary, so listing it under
+         itself just says the same word twice. */
+      const listed = (Array.isArray(r.items) ? r.items : [])
+        .filter((x) => String(x) !== String(r.detail));
+      const items = listed.length
+        ? '<span class="sysitems">' + esc(listed.join(' · ')) + '</span>' : '';
+      const note = r.note ? '<span class="sysitems">' + esc(String(r.note).slice(0, 120)) + '</span>' : '';
+      return '<button class="sysrow band-' + band + '" type="button"' +
+        (r.url ? ' data-nav="' + esc(r.url) + '"' : '') + '>' +
+        '<ha-icon icon="' + esc(SYSTEM_ICON[r.kind] || 'mdi:alert-outline') + '"></ha-icon>' +
+        '<span class="systext"><span class="sysname">' + esc(r.name) + '</span>' +
+        '<span class="sysdetail">' + esc(r.detail) + '</span>' + items + note + '</span>' +
+        '<ha-icon class="syschev" icon="mdi:chevron-right"></ha-icon></button>';
+    }).join('');
+    return sectionHtml('System', rows.length + (rows.length === 1 ? ' finding' : ' findings'),
+      '<div class="sysrows">' + body + '</div>', 'sec-system');
+  }
+
+  /**
+   * Execution errors, as their own tier inside configuration health.
+   *
+   * They are deliberately not folded in with BROKEN or IMPAIRED. Those two
+   * say something about what the configuration refers to; this says the
+   * configuration is entirely sound and the house would not do as it was
+   * told. Ninety-four failures are one row, because they were one incident.
+   */
+  function executionHtml(ops, state) {
+    if (!ops || !ops.execution.length) return '';
+    const live = ops.execution.filter((e) => e.severity === 'actionable');
+    const past = ops.execution.filter((e) => e.severity !== 'actionable');
+    const row = (e) => {
+      const current = e.severity === 'actionable';
+      const band = current ? (e.safety ? 'critical' : 'exec') : 'muted';
+      const when = current
+        ? e.failures + ' failed action' + (e.failures === 1 ? '' : 's') +
+          ' · latest ' + esc(String(e.last || '').slice(11, 16))
+        : e.failures + ' failed action' + (e.failures === 1 ? '' : 's') +
+          ' · stopped ' + esc(String(e.last || '').slice(11, 16));
+      const open = state && state.open && state.open.has('exec:' + e.entity_id);
+      return '<div class="execrow band-' + band + (open ? ' is-open' : '') + '" data-exec="' + esc(e.entity_id) + '">' +
+        '<div class="exchead">' +
+        '<ha-icon icon="' + (e.type === 'script' ? 'mdi:script-text-outline' : 'mdi:robot-outline') + '"></ha-icon>' +
+        '<span class="extext"><span class="exname">' + esc(e.name) +
+        (e.safety ? '<span class="exsafety">safety</span>' : '') + '</span>' +
+        '<span class="exwhen">' + when + '</span></span>' +
+        '<span class="excount">' + e.failures + '</span>' +
+        '<ha-icon class="exchev" icon="mdi:chevron-down"></ha-icon></div>' +
+        (open
+          ? '<div class="exbody">' +
+            (e.where ? '<div class="exline"><span>Step</span><span>' + esc(e.where) + '</span></div>' : '') +
+            (e.step ? '<div class="exline"><span>Action</span><span>' + esc(e.step) + '</span></div>' : '') +
+            '<div class="exline"><span>Error</span><span>' + esc(e.error) + '</span></div>' +
+            '<div class="exline"><span>First</span><span>' + esc(e.first || '?') + '</span></div>' +
+            '<div class="exline"><span>Latest</span><span>' + esc(e.last || '?') + '</span></div>' +
+            '<div class="exline"><span>In the last hour</span><span>' + e.recent + '</span></div>' +
+            '<div class="exline"><span>Still recurring</span><span>' + (e.recurring ? 'yes' : 'no') + '</span></div>' +
+            (e.enabled ? '' : '<div class="exline"><span>Automation</span><span>currently switched off</span></div>') +
+            '<div class="exact"><button class="exopen" type="button" data-execopen="' + esc(e.entity_id) + '">' +
+            '<ha-icon icon="mdi:open-in-new"></ha-icon>Open ' + (e.type === 'script' ? 'script' : 'automation') +
+            '</button></div></div>'
+          : '') +
+        '</div>';
+    };
+    let html = '';
+    if (live.length) {
+      html += '<div class="exgroup"><span class="exlabel">Execution errors</span>' +
+        live.map(row).join('') + '</div>';
+    }
+    if (past.length) {
+      html += '<div class="exgroup is-past"><span class="exlabel">Recently recovered · ' +
+        past.length + '</span>' + past.map(row).join('') + '</div>';
+    }
+    return html;
+  }
+
+  /**
+   * Devices worth looking at because of how the last day went, not because
+   * of how they are right now.
+   */
+  function unstableSection(model) {
+    const un = model.unstable;
+    if (!un || !un.devices) return '';
+    const devices = (model.hassDevices) || {};
+    /* Skip means skipped everywhere, including here: a printer that spends
+       half its life in another house is not an unstable device. */
+    const skipped = model.skipped || new Set();
+    const rows = un.devices
+      .map((r) => ({ ...r, band: unstableBand(r) }))
+      .filter((r) => r.band && !(r.deviceId && skipped.has(r.deviceId)))
+      .sort((a, b) => a.availability - b.availability || b.transitions - a.transitions);
+    if (!rows.length) return '';
+    const body = rows.map((r) => {
+      const dev = r.deviceId && devices[r.deviceId];
+      const name = dev ? (dev.name_by_user || dev.name || r.entityId) : r.entityId;
+      const pct = Math.round(r.availability * 1000) / 10;
+      return '<div class="unrow band-' + (r.band === 'critical' ? 'critical' : 'warn') + '">' +
+        '<ha-icon icon="mdi:transit-connection-variant"></ha-icon>' +
+        '<span class="untext"><span class="unname">' + esc(name) + '</span>' +
+        '<span class="undetail">' + pct + '% available · ' + r.transitions +
+        ' disconnect' + (r.transitions === 1 ? '' : 's') + ' · ' +
+        esc(durationText(r.downMs)) + ' offline</span>' +
+        '<span class="unlongest">Longest outage ' + esc(durationText(r.longestMs)) + '</span></span></div>';
+    }).join('');
+    const note = un.maskedWindows
+      ? un.maskedWindows + ' restart window' + (un.maskedWindows === 1 ? '' : 's') + ' excluded'
+      : 'last 24 hours';
+    return sectionHtml('Unstable devices', note, '<div class="unrows">' + body + '</div>', 'sec-unstable');
+  }
+
   function configSection(model, state) {
     const conf = model.config;
     if (!conf || !conf.ready) return '';
     const ignored = ignoredHtml(conf, state);
+    /* Execution errors belong to configuration health but not to any of its
+       existing tiers, so they render above the reference findings with their
+       own heading rather than being mixed into them. */
+    const execution = executionHtml(model.ops, state);
 
     if (!conf.problems.length) {
+      /* Saying "healthy" while an automation is failing every minute would be
+         the same blind spot this feature was built to close. */
+      if (execution) {
+        return sectionHtml(
+          'Configuration issues', 'execution',
+          execution + ignored, 'sec-config'
+        );
+      }
       return sectionHtml(
         'Configuration issues', '',
         '<div class="allgood"><ha-icon icon="mdi:check-circle-outline"></ha-icon>' +
@@ -5154,6 +5669,7 @@
     return sectionHtml(
       'Configuration issues',
       rows.length + (rows.length === 1 ? ' item' : ' items'),
+      execution +
       (chips.length > 2 ? chipsHtml(chips, active, 'confchip') : '') +
       '<div class="probs">' + rows.join('') + '</div>' + ignored,
       'sec-config'
@@ -5677,6 +6193,82 @@ ha-card.mini.overall { overflow: hidden; }
    304px tile. */
 /* Inline, inside the note's own text run, so they reflow with it instead of
    becoming flex items that force a line of their own. */
+/* --- system, execution errors and unstable devices ----------------- */
+.sysrows, .unrows { display: flex; flex-direction: column; gap: 6px; }
+.sysrow {
+  display: grid; grid-template-columns: 20px 1fr 18px; gap: 10px; align-items: center;
+  width: 100%; text-align: left; padding: 9px 10px; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--divider-color, #444); background: transparent;
+  color: var(--primary-text-color); font: inherit;
+}
+.sysrow ha-icon { --mdc-icon-size: 20px; }
+.systext { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.sysname { font-weight: 600; font-size: 0.95em; }
+.sysdetail, .sysitems { font-size: 0.82em; opacity: 0.78; }
+.sysitems { opacity: 0.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.syschev { opacity: 0.5; --mdc-icon-size: 18px; }
+.unrow {
+  display: grid; grid-template-columns: 20px 1fr; gap: 10px; align-items: center;
+  padding: 9px 10px; border-radius: 10px; border: 1px solid var(--divider-color, #444);
+}
+.untext { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.unname { font-weight: 600; font-size: 0.95em; }
+.undetail { font-size: 0.82em; opacity: 0.8; }
+.unlongest { font-size: 0.78em; opacity: 0.6; }
+
+.exgroup { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.exlabel {
+  font-size: 0.72em; letter-spacing: 0.08em; text-transform: uppercase;
+  opacity: 0.65; font-weight: 700;
+}
+.exgroup.is-past .exlabel { opacity: 0.45; }
+.execrow { border: 1px solid var(--divider-color, #444); border-radius: 10px; overflow: hidden; }
+.exchead {
+  display: grid; grid-template-columns: 20px 1fr auto 18px; gap: 10px; align-items: center;
+  padding: 9px 10px; cursor: pointer;
+}
+.exchead ha-icon { --mdc-icon-size: 20px; }
+.extext { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.exname { font-weight: 600; font-size: 0.95em; display: flex; align-items: center; gap: 6px; }
+.exsafety {
+  font-size: 0.62em; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700;
+  padding: 1px 5px; border-radius: 5px; background: var(--error-color, #db4437); color: #fff;
+}
+.exwhen { font-size: 0.82em; opacity: 0.8; }
+.excount { font-variant-numeric: tabular-nums; font-weight: 700; opacity: 0.8; }
+.exchev { opacity: 0.5; --mdc-icon-size: 18px; transition: transform 0.15s ease; }
+.execrow.is-open .exchev { transform: rotate(180deg); }
+.exbody {
+  border-top: 1px solid var(--divider-color, #444); padding: 8px 10px 10px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.exline { display: grid; grid-template-columns: 128px 1fr; gap: 8px; font-size: 0.82em; }
+.exline > span:first-child { opacity: 0.6; }
+.exline > span:last-child { word-break: break-word; }
+.exact { margin-top: 6px; }
+.exopen {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font: inherit;
+  font-size: 0.82em; padding: 5px 10px; border-radius: 8px; background: transparent;
+  border: 1px solid var(--divider-color, #444); color: var(--primary-text-color);
+}
+.exopen ha-icon { --mdc-icon-size: 16px; }
+.execrow.band-critical, .sysrow.band-critical, .unrow.band-critical {
+  border-color: var(--error-color, #db4437);
+  box-shadow: inset 3px 0 0 var(--error-color, #db4437);
+}
+.execrow.band-exec {
+  border-color: var(--warning-color, #ffa726);
+  box-shadow: inset 3px 0 0 var(--warning-color, #ffa726);
+}
+.sysrow.band-warn, .unrow.band-warn {
+  box-shadow: inset 3px 0 0 var(--warning-color, #ffa726);
+}
+.execrow.band-muted { opacity: 0.7; }
+@container dhcard (max-width: 420px) {
+  .exline { grid-template-columns: 1fr; gap: 0; }
+  .sysitems { white-space: normal; }
+}
+
 .opswhen, .opsnext { opacity: 0.85; white-space: nowrap; }
 .opswhen::before, .opsnext::before { content: " · "; }
 @container dhcard (max-width: 560px) {
@@ -6232,12 +6824,14 @@ ha-card.mini.overall { overflow: hidden; }
       /* Durations and the recovery window move on their own; a 30s tick keeps
          them honest without rebuilding anything. */
       this._timer = window.setInterval(() => this._tick(), 30000);
+      liveCards.add(this);
       if (this._config && isCompact(this._config.mode)) compactPeers.add(this);
     }
 
     disconnectedCallback() {
       if (this._timer) window.clearInterval(this._timer);
       this._timer = null;
+      liveCards.delete(this);
       /* A tile that leaves the page must stop propping its peer up. */
       if (compactPeers.delete(this)) {
         this._compactHasProblem = false;
@@ -6460,8 +7054,16 @@ ha-card.mini.overall { overflow: hidden; }
          costs a lookup per unavailable entity, not a walk of anything. */
       if (model.config) joinRuntime(model.config, this._hass, this._config);
       model.conflicts = configCache.model && configCache.model.conflicts;
+      model.ops = opsModel(this._hass);
+      model.hassDevices = this._hass.devices || {};
+      model.skipped = skippedDevices(this._hass, this._config);
+      model.unstable = unstableCache.data;
       this._model = model;
       this._render();
+      /* The history sweep is one query for the whole house and it does not
+         block anything: the page paints from state first and the section
+         appears when the answer arrives. */
+      this._scanUnstable(false);
       /* The device tile never reads configuration, so it never triggers the
          scan - which is what keeps three cards from meaning three scans. */
       if (mode !== 'device-compact') this._scanConfig(false);
@@ -6493,9 +7095,48 @@ ha-card.mini.overall { overflow: hidden; }
       else window.setTimeout(run, 60);
     }
 
+    /**
+     * The 24-hour availability sweep. Cached across every card on the page
+     * and every render, because it answers a question about yesterday and
+     * yesterday does not change every time a light switches on.
+     */
+    _scanUnstable(force) {
+      if (!this._hass || !this._model) return;
+      /* Only the modes that can show the answer pay for it. The configuration
+         and conflict tiles never mention a device. */
+      const mode = this._config.mode;
+      if (mode === 'configuration-compact' || mode === 'conflicts-compact') return;
+      if (!force && unstableCache.data &&
+          Date.now() - unstableCache.at < UNSTABLE_TTL_MS) {
+        /* Already answered, possibly for a different card. */
+        if (this._model.unstable !== unstableCache.data) {
+          this._model.unstable = unstableCache.data;
+          this._render();
+        }
+        return;
+      }
+      if (this._unstabling) return;
+      this._unstabling = true;
+      getUnstable(this._hass, force).then((result) => {
+        this._unstabling = false;
+        if (!result) return;
+        for (const card of liveCards) {
+          if (!card._model) continue;
+          card._model.unstable = result;
+          card._render();
+        }
+      });
+    }
+
     /** Ages only: no model rebuild, no innerHTML churn on the whole page. */
     _tick() {
       if (!this._model) return;
+      /* The one exception. Availability answers a question about the last
+         day, so nothing in the state machine ever prompts a refresh - a house
+         where nothing changes is exactly the house whose overnight outage
+         would otherwise stay on the page forever. The cache decides whether
+         this actually queries anything. */
+      this._scanUnstable(false);
       const now = Date.now();
       const root = this.shadowRoot;
       if (!root) return;
@@ -6522,6 +7163,8 @@ ha-card.mini.overall { overflow: hidden; }
       const parts = [];
       for (const name of want) {
         if (name === 'house') parts.push(houseSection(model, cfg));
+        else if (name === 'system') parts.push(systemSection(model));
+        else if (name === 'unstable') parts.push(unstableSection(model));
         else if (name === 'summary') parts.push(summarySection(model, cfg));
         else if (name === 'config_summary') parts.push(configSummarySection(model));
         else if (name === 'config') parts.push(configSection(model, this._state));
@@ -6600,7 +7243,7 @@ ha-card.mini.overall { overflow: hidden; }
         ? deviceCompact(this._model, this._config)
         : mode === 'conflicts-compact'
           ? conflictsCompact(this._model.conflicts)
-          : configCompact(this._model.config);
+          : configCompact(this._model.config, this._model.ops);
 
       /* Published before the peers are consulted, so they read the current
          answer rather than the previous one. */
@@ -6781,6 +7424,27 @@ ha-card.mini.overall { overflow: hidden; }
       }
     }
 
+    /**
+     * Open the editor for an automation or script named by entity id.
+     *
+     * Automations are edited by the numeric id the state machine carries and
+     * scripts by their object id, so the route cannot be built from the
+     * entity id alone - and an item whose id is missing still has a
+     * more-info dialog, which beats doing nothing.
+     */
+    _openItem(entityId) {
+      const st = this._hass && this._hass.states[entityId];
+      const domain = domainOf(entityId);
+      if (domain === 'script') {
+        return this._navigate('/config/script/edit/' + entityId.split('.')[1]);
+      }
+      const id = st && st.attributes && st.attributes.id;
+      if (id) return this._navigate('/config/automation/edit/' + id);
+      this.dispatchEvent(new CustomEvent('hass-more-info', {
+        detail: { entityId }, bubbles: true, composed: true,
+      }));
+    }
+
     _navigate(path) {
       history.pushState(null, '', path);
       window.dispatchEvent(new CustomEvent('location-changed', { bubbles: true, composed: true }));
@@ -6824,6 +7488,20 @@ ha-card.mini.overall { overflow: hidden; }
               composed: true,
             })
           );
+          return;
+        }
+        const execOpen = ev.target.closest('[data-execopen]');
+        if (execOpen) {
+          ev.stopPropagation();
+          this._openItem(execOpen.dataset.execopen);
+          return;
+        }
+        const exec = ev.target.closest('[data-exec]');
+        if (exec) {
+          const key = 'exec:' + exec.dataset.exec;
+          if (this._state.open.has(key)) this._state.open.delete(key);
+          else this._state.open.add(key);
+          this._render();
           return;
         }
         const nav = ev.target.closest('[data-nav]');
@@ -6913,6 +7591,17 @@ ha-card.mini.overall { overflow: hidden; }
     analyseConflicts, conflictsCompact, overallCompact, sequenceDuration, durationSeconds, triggerOccurrences,
     collectTargets, areOpposites, clockToMinutes, minutesToClock, DEFAULT_CONFLICTS,
     deviceCompact, configCompact,
+    opsModel, computeUnstable, unstableBand, unstableProbes, unstableRank,
+    systemSection, executionHtml, unstableSection,
+    UNSTABLE: {
+      warn: UNSTABLE_WARN_AVAILABILITY,
+      critical: UNSTABLE_CRITICAL_AVAILABILITY,
+      minTransitions: UNSTABLE_MIN_TRANSITIONS,
+      disconnectAnomaly: UNSTABLE_DISCONNECT_ANOMALY,
+      massRatio: UNSTABLE_MASS_RATIO,
+      massPadMs: UNSTABLE_MASS_PAD_MS,
+      windowMs: UNSTABLE_WINDOW_MS,
+    },
     DEFAULTS: {
       ignored_domains: DEFAULT_IGNORED_DOMAINS,
       unavailable_is_fault_domains: DEFAULT_UNAVAILABLE_IS_FAULT,

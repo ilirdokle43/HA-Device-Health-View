@@ -400,6 +400,17 @@ def _epoch(stamp):
         return None
 
 
+# Severities that can reach a phone. `execution` and `system` join the
+# original two because they are the same kind of statement: something is
+# wrong now and a person can do something about it. They push immediately,
+# like `broken` - an add-on that has crashed or an automation whose actions
+# are failing is not going to become less true if it is left for five
+# minutes, and unlike `impaired` there is no flicker to wait out.
+PUSHABLE = ("broken", "impaired", "execution", "system")
+
+IMMEDIATE = ("broken", "execution", "system")
+
+
 def decide_notifications(findings, state, now_ts, background,
                          stable=IMPAIRED_STABLE_SECONDS):
     """Fold the current findings into the incident store and say what is new.
@@ -427,7 +438,8 @@ def decide_notifications(findings, state, now_ts, background,
     """
     now_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts))
     incidents = state.setdefault("incidents", {})
-    actionable = [f for f in findings if f.get("severity") in ("broken", "impaired")]
+    actionable = [f for f in findings
+                  if f.get("severity") in PUSHABLE]
     live = set()
     fresh = []
 
@@ -444,7 +456,7 @@ def decide_notifications(findings, state, now_ts, background,
             incidents[fp] = rec
         if rec.get("notified"):
             continue
-        if f["severity"] == "impaired":
+        if f["severity"] not in IMMEDIATE:
             seen_at = _epoch(rec.get("first_seen"))
             if seen_at is None or now_ts - seen_at < stable:
                 continue
@@ -470,7 +482,16 @@ MAX_LISTED = 6
 def notification_text(fresh):
     """One message for however many problems appeared, never one each."""
     n = len(fresh)
-    lines = ["%d new configuration problem%s" % (n, "" if n == 1 else "s"), ""]
+    kinds = {f.get("severity") for f in fresh}
+    if kinds <= {"execution"}:
+        noun = "execution error"
+    elif kinds <= {"system"}:
+        noun = "system problem"
+    elif kinds <= {"broken", "impaired"}:
+        noun = "configuration problem"
+    else:
+        noun = "problem"
+    lines = ["%d new %s%s" % (n, noun, "" if n == 1 else "s"), ""]
     if n <= MAX_LISTED:
         for f in fresh:
             lines.append("• %s — %s"
@@ -481,6 +502,10 @@ def notification_text(fresh):
             if f["severity"] == "broken":
                 key = "broken %s%s" % (f.get("owner_type") or "item",
                                        "" if (f.get("owner_type") or "").endswith("s") else "s")
+            elif f["severity"] == "execution":
+                key = "failing automations"
+            elif f["severity"] == "system":
+                key = "system problems"
             else:
                 key = "impaired dependencies"
             buckets[key] = buckets.get(key, 0) + 1
@@ -807,3 +832,429 @@ def save_ignores(rules, stamp):
     with open(IGNORE_FILE, "w", encoding="utf-8") as fh:
         json.dump({"version": 1, "updated": stamp, "rules": rules}, fh, indent=2)
     return len(rules)
+
+
+# ======================================================================
+# OPERATIONAL HEALTH
+#
+# Everything below answers a different question from the rest of this file.
+# The scanner above asks "does this configuration point at something that
+# exists". These ask "is the house working right now" - and the answer comes
+# from Home Assistant's own structured state rather than from parsing files.
+#
+# The pump incident is why this exists. On 2026-08-29 a water-safety
+# automation tried to switch off a running pump 94 times in 93 minutes and
+# failed every time, because the Zigbee plug would not answer. Every
+# reference in that automation was valid, every entity existed, the
+# automation ran on schedule - and the configuration scanner had nothing to
+# say, because nothing was broken. The action failed. That is a third thing,
+# and it needed its own name.
+# ======================================================================
+
+# --- the log window ---------------------------------------------------
+#
+# `system_log` already does the hard part. Home Assistant keeps every
+# WARNING and ERROR in memory, deduplicated by (logger, source line), with a
+# running count and the first and last time it was seen. Ninety-four
+# identical failures arrive as ONE record with count 94 - which is exactly
+# the consolidation this feature needs, for free.
+#
+# What it does not give is a rate. `count` is cumulative since the record
+# first appeared, so "three failures in the last hour" cannot be read off it.
+# That is what the snapshot file is for: each poll stores (timestamp, count)
+# per key, the series is trimmed to the window, and the difference between
+# the newest and oldest sample in the series is the number of failures inside
+# it. Poll every five minutes and the answer is accurate to five minutes,
+# which is finer than any threshold here needs.
+LOG_STATE_FILE = os.path.join(CONFIG_DIR, "config_health_log_state.json")
+
+# How long "recently" means when counting failures.
+LOG_WINDOW_SECONDS = 3600
+
+# An automation or script whose actions failed this many times inside the
+# window is a problem worth showing. Below it, the failure is kept as history
+# and nothing is raised: a service call that failed once because a device was
+# asleep is not news, and a page that says so is a page nobody reads.
+EXEC_ACTIONABLE = 3
+
+# The same, for an automation the user has labelled safety-critical. One
+# failed attempt to shut off a pump is already the whole story. This applies
+# only to automations carrying the label below - it is never inferred from
+# what an automation is called.
+EXEC_SAFETY_ACTIONABLE = 1
+
+# No new failure for this long and the incident stops being current. It stays
+# on the page as recovered for EXEC_RETAIN_SECONDS so there is a record of
+# what happened, then disappears.
+EXEC_RECOVER_SECONDS = 900
+# Long enough that an incident at breakfast is still on the page after work.
+# Six hours was the first choice and it was too short: the pump failed at
+# 05:31 and had already vanished by the afternoon, which is exactly when
+# someone would come looking for it.
+EXEC_RETAIN_SECONDS = 24 * 3600
+
+# An integration failing behind a config entry that still says `loaded`.
+#
+# The first draft of this rule was a burst rate - ten errors in an hour - and
+# it was wrong. Measured against the install it was written for, the camera
+# that had been rejecting every poll with HTTP 401 for four days averaged
+# 6.4 errors an hour, and would have been missed by the very rule meant to
+# catch it. What distinguishes that failure from a network blip is not how
+# fast it fails but how long it has been failing: twenty hours and counting
+# versus two errors and done.
+#
+# So there are two ways in. A burst inside the window, which catches an
+# integration that has just fallen over; and persistence, which catches one
+# that has been quietly failing since before anyone was watching. Both
+# require the errors to be CURRENT - an integration that stopped throwing an
+# hour ago has recovered, whatever it did before.
+INTEG_ACTIONABLE = 10
+INTEG_RECENT_SECONDS = 900
+
+# Persistence: still failing, has been for this long, and has produced enough
+# to rule out a handful of retries around a reboot.
+INTEG_CRITICAL_SECONDS = 6 * 3600
+INTEG_CRITICAL_COUNT = 20
+INTEG_PERSISTENT_SECONDS = 3600
+INTEG_PERSISTENT_COUNT = 10
+
+# Backups. The schedule on this install is daily, so two missed days is the
+# first moment something is actually wrong.
+BACKUP_WARN_SECONDS = 48 * 3600
+BACKUP_CRITICAL_SECONDS = 7 * 24 * 3600
+
+# Loggers that are noise no matter how often they fire. Each one is here
+# because it was measured, not because it looked unimportant.
+LOG_IGNORE_PREFIXES = (
+    # Browser-side crashes reported back by the companion app. 247 of them in
+    # four days, every one "Script error. null @:0:0" - cross-origin, no
+    # stack, no attribution. There is nothing a person could do with these.
+    "frontend.js",
+    # "We found a custom integration X which has not been tested" - one per
+    # custom integration per restart, permanently.
+    "homeassistant.loader",
+    # Deprecation notices aimed at integration authors, not at this house.
+    "homeassistant.helpers.frame",
+    "homeassistant.const",
+)
+
+EXEC_LOGGER_RE = re.compile(
+    r"^homeassistant\.components\.(automation|script)\.(.+)$")
+
+# "Alias: Choose at step 3: <branch alias>: Error executing script.
+#  Error for call_service at pos 2: <error>"
+EXEC_STEP_RE = re.compile(
+    r"Error (?:executing script\. Error )?for ([a-z_]+) at pos (\d+): (.*)$",
+    re.S)
+EXEC_PATH_RE = re.compile(r"^[^:]+: ((?:[A-Z][a-z]+ at step \d+.*?): )?")
+
+# `source` is (path, line) inside Home Assistant, and for an integration
+# error the path is nearly always components/<domain>/... - which maps the
+# error to an integration even when the logger belongs to an upstream library
+# (`kasa.smart.smartdevice` raised from components/tplink/coordinator.py).
+SOURCE_DOMAIN_RE = re.compile(r"^(?:custom_)?components/([a-z0-9_]+)/")
+LOGGER_DOMAIN_RE = re.compile(
+    r"^(?:homeassistant|custom_components)\.components?\.([a-z0-9_]+)")
+CUSTOM_DOMAIN_RE = re.compile(r"^custom_components\.([a-z0-9_]+)")
+
+
+def load_log_state():
+    """The per-key sample series from the previous polls. Never raises."""
+    try:
+        with open(LOG_STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    return data.get("keys", {}) if isinstance(data, dict) else {}
+
+
+def save_log_state(keys, stamp):
+    with open(LOG_STATE_FILE, "w", encoding="utf-8") as fh:
+        json.dump({"version": 1, "updated": stamp, "keys": keys}, fh)
+    return len(keys)
+
+
+def log_key(rec):
+    """Stable identity for one deduplicated log record.
+
+    Home Assistant keys its own store on (logger, source, root cause); the
+    first two are in the payload and are enough to be unique here.
+    """
+    src = rec.get("source") or ("", 0)
+    try:
+        path, line = src[0], src[1]
+    except Exception:
+        path, line = str(src), 0
+    return "%s|%s|%s" % (rec.get("name") or "", path, line)
+
+
+def fold_log_window(records, state, now_ts, window=LOG_WINDOW_SECONDS):
+    """Turn cumulative counts into "how many happened inside the window".
+
+    Returns (incidents, new_state). Each incident carries the record's own
+    consolidated fields plus `recent`, the number of occurrences inside the
+    window.
+
+    A count that went DOWN means Home Assistant restarted and cleared its log
+    store, so the series is started again rather than producing a negative
+    rate. A key that is present for the first time contributes its whole
+    count, which is right: it is new since the last poll.
+    """
+    out = []
+    fresh = {}
+    for rec in records:
+        key = log_key(rec)
+        count = int(rec.get("count") or 0)
+        series = []
+        prev = state.get(key)
+        if isinstance(prev, dict) and isinstance(prev.get("series"), list):
+            series = [s for s in prev["series"]
+                      if isinstance(s, list) and len(s) == 2
+                      and (now_ts - s[0]) <= window
+                      and s[1] <= count]
+        series = series + [[now_ts, count]]
+        fresh[key] = {"series": series}
+        base = series[0][1] if len(series) > 1 else 0
+        recent = max(0, count - base)
+        out.append({
+            "key": key,
+            "name": rec.get("name") or "",
+            "level": rec.get("level") or "ERROR",
+            "message": (rec.get("message") or [""])[0],
+            "source": rec.get("source") or ("", 0),
+            "exception": rec.get("exception") or "",
+            "count": count,
+            "recent": recent,
+            "first": float(rec.get("first_occurred") or now_ts),
+            "last": float(rec.get("timestamp") or now_ts),
+        })
+    return out, fresh
+
+
+def log_is_noise(name):
+    return any(str(name).startswith(p) for p in LOG_IGNORE_PREFIXES)
+
+
+# --- execution errors -------------------------------------------------
+
+def parse_execution(inc):
+    """Pull the automation/script identity and the failing step out of a log
+    record, or None if this is not an execution failure.
+
+    Two shapes reach this logger. The detailed one names the branch and the
+    action position; the summary one only says the automation failed. The
+    detailed one is preferred when both are present for the same item, which
+    is why `detail` is scored here rather than at the call site.
+    """
+    m = EXEC_LOGGER_RE.match(inc.get("name") or "")
+    if not m:
+        return None
+    domain, object_id = m.group(1), m.group(2)
+    msg = inc.get("message") or ""
+    step = None
+    error = msg
+    sm = EXEC_STEP_RE.search(msg)
+    if sm:
+        step = "%s at position %s" % (sm.group(1).replace("_", " "), sm.group(2))
+        error = sm.group(3).strip()
+    where = None
+    pm = re.search(r": ((?:Choose|Repeat|If|Parallel|Sequence) at step \d+[^:]*)", msg)
+    if pm:
+        where = pm.group(1).strip()
+    return {
+        "domain": domain,
+        "object_id": object_id,
+        "entity_id": "%s.%s" % (domain, object_id),
+        "step": step,
+        "where": where,
+        "error": error.strip(),
+        "detail": 1 if sm else 0,
+    }
+
+
+def execution_severity(recent, last_ts, now_ts, safety=False,
+                       actionable=EXEC_ACTIONABLE,
+                       safety_actionable=EXEC_SAFETY_ACTIONABLE):
+    """One of actionable / recovered / diagnostic / gone.
+
+    `actionable` needs both a rate and a pulse: enough failures inside the
+    window AND one recently enough that it is still happening. An incident
+    that has stopped becomes `recovered` for a while - a red row that never
+    goes away teaches people to ignore red rows - and then `gone`.
+    """
+    quiet = now_ts - last_ts
+    threshold = safety_actionable if safety else actionable
+    if recent >= threshold and quiet <= EXEC_RECOVER_SECONDS:
+        return "actionable"
+    if quiet > EXEC_RETAIN_SECONDS:
+        return "gone"
+    if recent >= threshold or quiet <= EXEC_RECOVER_SECONDS:
+        return "recovered" if quiet > EXEC_RECOVER_SECONDS else "diagnostic"
+    return "recovered"
+
+
+def merge_executions(parsed):
+    """One incident per automation, not one per distinct log line.
+
+    A single failing automation routinely produces two records - the detailed
+    "Choose at step 1 ... call_service at pos 1" line and the summary "Error
+    while executing automation" line - and an automation with two failing
+    branches produces four. Showing four rows for one broken thing is the
+    behaviour this whole feature exists to avoid, so they fold into one
+    incident keyed on the automation, keeping the most detailed step text and
+    the widest time span.
+    """
+    by_item = {}
+    for p, inc in parsed:
+        key = p["entity_id"]
+        cur = by_item.get(key)
+        if cur is None:
+            cur = {
+                "entity_id": p["entity_id"],
+                "domain": p["domain"],
+                "object_id": p["object_id"],
+                "step": p["step"],
+                "where": p["where"],
+                "error": p["error"],
+                "detail": p["detail"],
+                "count": 0,
+                "recent": 0,
+                "first": inc["first"],
+                "last": inc["last"],
+                "keys": [],
+            }
+            by_item[key] = cur
+        # The summary line and the detailed line describe the same failures,
+        # so counting both would double every incident. The detailed record
+        # wins on both text and count; a summary-only item still counts.
+        if p["detail"] >= cur["detail"]:
+            if p["detail"] > cur["detail"]:
+                cur["count"] = 0
+                cur["recent"] = 0
+            cur["step"] = p["step"] or cur["step"]
+            cur["where"] = p["where"] or cur["where"]
+            cur["error"] = p["error"] or cur["error"]
+            cur["detail"] = p["detail"]
+            cur["count"] += inc["count"]
+            cur["recent"] += inc["recent"]
+        cur["first"] = min(cur["first"], inc["first"])
+        cur["last"] = max(cur["last"], inc["last"])
+        cur["keys"].append(inc["key"])
+    return sorted(by_item.values(), key=lambda x: (-x["recent"], -x["last"]))
+
+
+# --- integration errors -----------------------------------------------
+
+def integration_of(inc):
+    """(domain, confidence) for the integration behind a log record.
+
+    The source file is the strongest signal and the logger name is the
+    weakest, because a library logger says nothing about which integration
+    invoked it: the Tapo camera's failures arrive under `kasa.smart.
+    smartdevice` but from `components/tplink/coordinator.py`, and only the
+    second one names an integration this install has.
+    """
+    src = inc.get("source") or ("", 0)
+    path = src[0] if isinstance(src, (list, tuple)) and src else str(src)
+    m = SOURCE_DOMAIN_RE.match(str(path))
+    if m:
+        return m.group(1), "high"
+    name = inc.get("name") or ""
+    m = LOGGER_DOMAIN_RE.match(name)
+    if m:
+        return m.group(1), "high"
+    m = CUSTOM_DOMAIN_RE.match(name)
+    if m:
+        return m.group(1), "medium"
+    return None, "none"
+
+
+def integration_severity(recent, last_ts, first_ts, now_ts, count=None,
+                         actionable=INTEG_ACTIONABLE):
+    """warning / critical / quiet.
+
+    `count` is the record's lifetime total and `recent` is how much of it
+    landed inside the window. Persistence is judged on the total and the
+    span, a burst on the window - and nothing is judged at all unless the
+    integration is still failing right now.
+
+    Critical is the only integration state allowed to reach the main
+    dashboard, and it means "still failing, and has been for hours".
+    """
+    if (now_ts - last_ts) > INTEG_RECENT_SECONDS:
+        return "quiet"
+    span = last_ts - first_ts
+    total = count if count is not None else recent
+    if span >= INTEG_CRITICAL_SECONDS and total >= INTEG_CRITICAL_COUNT:
+        return "critical"
+    if recent >= actionable:
+        return "warning"
+    if span >= INTEG_PERSISTENT_SECONDS and total >= INTEG_PERSISTENT_COUNT:
+        return "warning"
+    return "quiet"
+
+
+# --- add-ons ----------------------------------------------------------
+
+def addon_findings(addons):
+    """Add-ons that are not doing what they were configured to do.
+
+    Two states matter and nothing else does. `error` is the supervisor
+    saying the add-on failed. `boot: auto` with anything other than
+    `started` means it was meant to come up and did not. An add-on set to
+    start manually and currently stopped is working exactly as configured
+    and must never appear here.
+    """
+    out = []
+    for slug, info in sorted((addons or {}).items()):
+        state = info.get("state")
+        name = info.get("name") or slug
+        if state == "error":
+            out.append({"slug": slug, "name": name, "state": state,
+                        "severity": "actionable",
+                        "message": "Add-on is in an error state"})
+        elif info.get("boot") == "auto" and state != "started":
+            out.append({"slug": slug, "name": name, "state": state,
+                        "severity": "warning",
+                        "message": "Set to start on boot but is %s" % (state or "not running")})
+    return out
+
+
+# --- backups ----------------------------------------------------------
+
+def backup_finding(last_success_ts, last_attempt_ts, now_ts,
+                   warn=BACKUP_WARN_SECONDS, critical=BACKUP_CRITICAL_SECONDS):
+    """Age of the last successful automatic backup, and whether the last
+    attempt beat it.
+
+    An attempt newer than the last success is a failed run, and that is worth
+    saying immediately rather than waiting for the age threshold: the backup
+    is not just old, it is broken.
+    """
+    if last_success_ts is None:
+        return {"severity": "warning", "age": None,
+                "message": "No successful automatic backup on record"}
+    age = now_ts - last_success_ts
+    if last_attempt_ts is not None and last_attempt_ts > last_success_ts + 60:
+        return {"severity": "actionable", "age": age, "failed": True,
+                "message": "The last automatic backup attempt did not complete"}
+    if age >= critical:
+        return {"severity": "critical", "age": age,
+                "message": "No successful backup in %s" % duration_words(age)}
+    if age >= warn:
+        return {"severity": "actionable", "age": age,
+                "message": "Last successful backup %s ago" % duration_words(age)}
+    return None
+
+
+def duration_words(seconds):
+    """`2d 4h`, `6h 19m`, `14m`. Two units is always enough to act on."""
+    seconds = int(max(0, seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return "%dd %dh" % (days, hours)
+    if hours:
+        return "%dh %dm" % (hours, mins)
+    return "%dm" % mins
